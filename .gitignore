@@ -1,0 +1,17 @@
+# Local secrets
+.env
+
+# Local Coral binary/cache artifacts
+coral/
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+backend/.venv/
