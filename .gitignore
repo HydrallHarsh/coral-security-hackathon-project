@@ -15,3 +15,4 @@ wheels/
 # Virtual environments
 .venv/
 backend/.venv/
+.coral-config/

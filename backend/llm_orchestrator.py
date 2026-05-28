@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import urllib.error
 import urllib.request
 from typing import Any
@@ -96,6 +97,7 @@ def plan_with_openrouter(
     payload = {
         "model": model,
         "temperature": 0.1,
+        "max_tokens": 700,
         "messages": [
             {
                 "role": "system",
@@ -142,15 +144,16 @@ def plan_with_openrouter(
         method="POST",
     )
 
+    timeout_seconds = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "15"))
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             response_body = response.read().decode("utf-8")
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
         raise LLMPlannerError(f"OpenRouter HTTP {error.code}: {body}") from error
     except urllib.error.URLError as error:
         raise LLMPlannerError(f"OpenRouter request failed: {error}") from error
-    except TimeoutError as error:
+    except (TimeoutError, socket.timeout) as error:
         raise LLMPlannerError("OpenRouter request timed out") from error
 
     try:

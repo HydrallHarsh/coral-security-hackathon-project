@@ -5,7 +5,6 @@ import { motion, AnimatePresence } from "motion/react";
 import { EvidenceGraph } from "./components/EvidenceGraph";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-const REQUEST_TIMEOUT_MS = 45000;
 
 /* ─── Types ─── */
 type SourceCapabilities = { available?: boolean; configured?: boolean; tools?: string[] };
@@ -97,7 +96,7 @@ export default function Home() {
 
   async function refreshCapabilities() {
     try {
-      const r = await fetchWithTimeout(`${API_BASE}/agent/capabilities`);
+      const r = await fetch(`${API_BASE}/agent/capabilities`);
       if (!r.ok) throw new Error(`${r.status}`);
       setCapabilities(await r.json());
     } catch (err) {
@@ -130,7 +129,7 @@ export default function Home() {
       package_version: form.package_version, days: 7,
     };
     try {
-      const r = await fetchWithTimeout(`${API_BASE}/agent/investigate`, {
+      const r = await fetch(`${API_BASE}/agent/investigate`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
@@ -367,21 +366,6 @@ export default function Home() {
       </div>
     </motion.div>
   );
-}
-
-async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") {
-      throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
-    }
-    throw err;
-  } finally {
-    window.clearTimeout(timeout);
-  }
 }
 
 /* ═══════════════════════════════════════════════

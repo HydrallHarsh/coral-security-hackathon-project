@@ -1,4 +1,5 @@
 import json
+import os
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,8 +109,16 @@ def sql_string(value: str) -> str:
 
 
 def query_step(name: str, sql: str) -> dict[str, object]:
+    return query_step_with_timeout(name, sql, None)
+
+
+def query_step_with_timeout(
+    name: str,
+    sql: str,
+    timeout_seconds: float | None,
+) -> dict[str, object]:
     try:
-        result = coral.query(sql)
+        result = coral.query(sql, timeout_seconds=timeout_seconds)
     except CoralClientError as error:
         return {
             "name": name,
@@ -169,6 +178,7 @@ def skipped_step(name: str, reason: str) -> dict[str, object]:
 
 
 def query_capability_metadata() -> list[dict[str, object]]:
+    metadata_timeout = float(os.getenv("CORAL_METADATA_TIMEOUT_SECONDS", "6"))
     source_list = ", ".join(f"'{source}'" for source in REQUIRED_SOURCES)
     tool_tables = sorted(
         {
@@ -180,7 +190,7 @@ def query_capability_metadata() -> list[dict[str, object]]:
     table_list = ", ".join(f"'{table}'" for table in tool_tables)
 
     return [
-        query_step(
+        query_step_with_timeout(
             "metadata_tables",
             f"""
             SELECT schema_name, table_name, description, guide, required_filters
@@ -188,8 +198,9 @@ def query_capability_metadata() -> list[dict[str, object]]:
             WHERE schema_name IN ({source_list})
             ORDER BY schema_name, table_name
             """,
+            metadata_timeout,
         ),
-        query_step(
+        query_step_with_timeout(
             "metadata_table_functions",
             f"""
             SELECT schema_name, function_name, description, arguments_json,
@@ -198,8 +209,9 @@ def query_capability_metadata() -> list[dict[str, object]]:
             WHERE schema_name IN ({source_list})
             ORDER BY schema_name, function_name
             """,
+            metadata_timeout,
         ),
-        query_step(
+        query_step_with_timeout(
             "metadata_columns",
             f"""
             SELECT schema_name, table_name, column_name, data_type, is_nullable,
@@ -209,8 +221,9 @@ def query_capability_metadata() -> list[dict[str, object]]:
               AND table_name IN ({table_list})
             ORDER BY schema_name, table_name, ordinal_position
             """,
+            metadata_timeout,
         ),
-        query_step(
+        query_step_with_timeout(
             "metadata_filters",
             f"""
             SELECT schema_name, table_name, filter_name, filter_mode, is_required,
@@ -219,8 +232,9 @@ def query_capability_metadata() -> list[dict[str, object]]:
             WHERE schema_name IN ({source_list})
             ORDER BY schema_name, table_name, filter_name
             """,
+            metadata_timeout,
         ),
-        query_step(
+        query_step_with_timeout(
             "metadata_inputs",
             f"""
             SELECT schema_name, key, kind, required, is_set
@@ -228,6 +242,7 @@ def query_capability_metadata() -> list[dict[str, object]]:
             WHERE schema_name IN ({source_list})
             ORDER BY schema_name, key
             """,
+            metadata_timeout,
         ),
     ]
 
@@ -287,22 +302,36 @@ def query_capability_metadata_from_mcp() -> list[dict[str, object]]:
 
         sql_metadata = query_capability_metadata()
         by_name = {step["name"]: step for step in sql_metadata}
+        sql_tables = first_rows(by_name["metadata_tables"], limit=1000)
+        sql_functions = first_rows(by_name["metadata_table_functions"], limit=1000)
+        merged_tables = merge_metadata_rows(
+            table_rows,
+            sql_tables,
+            ("schema_name", "table_name"),
+        )
+        merged_functions = merge_metadata_rows(
+            function_rows,
+            sql_functions,
+            ("schema_name", "function_name"),
+        )
         return [
             {
                 "name": "metadata_tables",
                 "ok": True,
-                "rows": table_rows,
+                "rows": merged_tables,
                 "sql": None,
                 "error": None,
                 "discovery_backend": "coral_mcp",
+                "fallback": "merged_with_coral_sql_metadata",
             },
             {
                 "name": "metadata_table_functions",
                 "ok": True,
-                "rows": function_rows,
+                "rows": merged_functions,
                 "sql": None,
                 "error": None,
                 "discovery_backend": "coral_mcp",
+                "fallback": "merged_with_coral_sql_metadata",
             },
             by_name["metadata_columns"],
             by_name["metadata_filters"],
@@ -322,6 +351,19 @@ def query_capability_metadata_from_mcp() -> list[dict[str, object]]:
             }
         )
         return fallback_steps
+
+
+def merge_metadata_rows(
+    primary_rows: list[dict[str, object]],
+    fallback_rows: list[dict],
+    key_fields: tuple[str, ...],
+) -> list[dict[str, object]]:
+    merged: dict[tuple[object, ...], dict[str, object]] = {}
+    for row in fallback_rows:
+        merged[tuple(row.get(field) for field in key_fields)] = row
+    for row in primary_rows:
+        merged[tuple(row.get(field) for field in key_fields)] = row
+    return list(merged.values())
 
 
 def json_dumps(value: object) -> str:
@@ -359,6 +401,11 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
     columns = capability_rows(metadata_steps, "metadata_columns")
     filters = capability_rows(metadata_steps, "metadata_filters")
     inputs = capability_rows(metadata_steps, "metadata_inputs")
+    required_metadata_ok = all(
+        step.get("ok")
+        for step in metadata_steps
+        if step.get("name") != "metadata_mcp_discovery"
+    )
 
     table_names = {
         f"{row.get('schema_name')}.{row.get('table_name')}"
@@ -429,7 +476,7 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
             "available_tool_count": sum(
                 1 for tool in tools.values() if tool["available"]
             ),
-            "metadata_ok": all(step.get("ok") for step in metadata_steps),
+            "metadata_ok": required_metadata_ok,
         },
         "metadata_steps": metadata_steps,
     }
@@ -751,6 +798,7 @@ def build_evidence_graph(
     nodes: dict[str, dict[str, object]] = {}
     edges: list[dict[str, object]] = []
 
+    # Narrative-driven causal graph construction
     package_id = f"pkg:{req.package_ecosystem}:{req.package_name}:{req.package_version}"
     nodes[package_id] = {
         "id": package_id,
@@ -759,55 +807,71 @@ def build_evidence_graph(
     }
 
     for index, finding in enumerate(findings, start=1):
-        finding_id = f"finding:{index}"
-        nodes[finding_id] = {
-            "id": finding_id,
-            "type": "finding",
-            "label": str(finding.get("title") or finding.get("type")),
-            "severity": finding.get("severity"),
-            "score": finding.get("score"),
-        }
-        edges.append({"from": finding_id, "to": package_id, "type": "concerns"})
-        finding["graph_node_id"] = finding_id
-
+        # We DO NOT create a finding node in the graph anymore.
+        # Instead, we construct the causal chain from the evidence.
+        
+        vuln_nodes = []
+        source_nodes = []
+        other_evidence = []
+        
         for evidence_index, evidence in enumerate(finding.get("evidence", []), start=1):
             if not isinstance(evidence, dict):
                 continue
-
+            
             source = str(evidence.get("source") or "evidence")
             label = str(evidence.get("text") or source)
             evidence_id = f"evidence:{index}:{evidence_index}"
-
-            if source == "osv.query_by_version" and evidence.get("url"):
-                evidence_id = f"vuln:{str(evidence['url']).rsplit('/', 1)[-1]}"
-                edge_type = "affected_by"
-                node_type = "vulnerability"
-            elif source == "github.pulls":
-                edge_type = "introduced_or_related_to"
-                node_type = "pull_request"
-            elif source == "github.alerts":
-                edge_type = "reported_by"
-                node_type = "github_alert"
-            elif source == "github.search_code":
-                edge_type = "found_in"
-                node_type = "code_search_result"
-            else:
-                edge_type = "supported_by"
-                node_type = "evidence"
-
-            nodes[evidence_id] = {
+            
+            node = {
                 "id": evidence_id,
-                "type": node_type,
                 "label": label,
                 "source": source,
                 "url": evidence.get("url"),
             }
-            edges.append({"from": finding_id, "to": evidence_id, "type": edge_type})
+            
+            if source == "osv.query_by_version" and evidence.get("url"):
+                evidence_id = f"vuln:{str(evidence['url']).rsplit('/', 1)[-1]}"
+                node["id"] = evidence_id
+                node["type"] = "vulnerability"
+                # Pass severity and score to vuln if available in finding
+                if finding.get("severity"): node["severity"] = finding.get("severity")
+                if finding.get("score"): node["score"] = finding.get("score")
+                vuln_nodes.append(evidence_id)
+            elif source == "github.pulls":
+                node["type"] = "pull_request"
+                source_nodes.append(evidence_id)
+            elif source == "github.alerts":
+                node["type"] = "github_alert"
+                vuln_nodes.append(evidence_id)
+            elif source == "github.search_code":
+                node["type"] = "code_search_result"
+                other_evidence.append(evidence_id)
+            else:
+                node["type"] = "evidence"
+                other_evidence.append(evidence_id)
+                
+            nodes[evidence_id] = node
 
-        for policy_index, policy in enumerate(
-            finding.get("policy_context", []),
-            start=1,
-        ):
+        # Build causality
+        # 1. Sources -> Package
+        for src_id in source_nodes:
+            edges.append({"from": src_id, "to": package_id, "type": "introduced"})
+            
+        # 2. Package -> Vulnerabilities
+        for v_id in vuln_nodes:
+            edges.append({"from": package_id, "to": v_id, "type": "matched"})
+            
+        # 3. Vulnerabilities -> Other Evidence
+        # If no vuln, Package -> Other Evidence
+        for ev_id in other_evidence:
+            if vuln_nodes:
+                for v_id in vuln_nodes:
+                    edges.append({"from": v_id, "to": ev_id, "type": "documented_by"})
+            else:
+                edges.append({"from": package_id, "to": ev_id, "type": "supported_by"})
+                
+        # Policies
+        for policy_index, policy in enumerate(finding.get("policy_context", []), start=1):
             if not isinstance(policy, dict):
                 continue
             policy_id = f"policy:{index}:{policy_index}"
@@ -818,12 +882,15 @@ def build_evidence_graph(
                 "source": policy.get("source"),
                 "url": policy.get("url"),
             }
-            edges.append({"from": policy_id, "to": finding_id, "type": "informs"})
-
-        for discussion_index, discussion in enumerate(
-            finding.get("discussion_context", []),
-            start=1,
-        ):
+            # Policy -> Vuln if exists, else Policy -> Package
+            if vuln_nodes:
+                for v_id in vuln_nodes:
+                    edges.append({"from": v_id, "to": policy_id, "type": "violates"})
+            else:
+                edges.append({"from": package_id, "to": policy_id, "type": "violates"})
+                
+        # Discussions
+        for discussion_index, discussion in enumerate(finding.get("discussion_context", []), start=1):
             if not isinstance(discussion, dict):
                 continue
             discussion_id = f"discussion:{index}:{discussion_index}"
@@ -833,9 +900,8 @@ def build_evidence_graph(
                 "label": str(discussion.get("text") or "Slack discussion"),
                 "source": discussion.get("source"),
             }
-            edges.append(
-                {"from": discussion_id, "to": finding_id, "type": "discusses"}
-            )
+            # Discussion connects to Package
+            edges.append({"from": package_id, "to": discussion_id, "type": "discussed_in"})
 
     return {"nodes": list(nodes.values()), "edges": edges}
 
@@ -881,6 +947,31 @@ def agent_capabilities() -> dict[str, object]:
         "description": "Coral metadata-derived HarborGuard investigation capabilities.",
         "required_sources": list(REQUIRED_SOURCES),
         "capabilities": capabilities,
+    }
+
+
+@app.get("/agent/coral-debug")
+def agent_coral_debug() -> dict[str, object]:
+    try:
+        source_list = coral.source_list()
+    except Exception as error:
+        source_list_payload: dict[str, object] = {
+            "ok": False,
+            "error": str(error),
+        }
+    else:
+        source_list_payload = {
+            "ok": source_list.returncode == 0,
+            "returncode": source_list.returncode,
+            "stdout": source_list.stdout,
+            "stderr": source_list.stderr,
+        }
+
+    return {
+        "coral_bin": coral.coral_bin,
+        "coral_config_dir": coral.config_dir,
+        "source_list": source_list_payload,
+        "sql_metadata": query_capability_metadata(),
     }
 
 
