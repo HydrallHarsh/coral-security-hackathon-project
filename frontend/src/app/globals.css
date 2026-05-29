@@ -339,6 +339,16 @@ h1, h2, h3, h4 {
   color: var(--accent);
 }
 
+.cfgSummary.small {
+  font-size: 0.76rem;
+  padding: 8px 14px;
+  margin-top: 14px;
+}
+
+.advancedDrawer {
+  margin-top: 10px;
+}
+
 .cfgGrid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -690,6 +700,34 @@ h1, h2, h3, h4 {
   line-height: 1.35;
 }
 
+.targetPill {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--raised-solid);
+  border: 1px solid var(--border);
+  font-size: 0.76rem;
+  color: var(--text-2);
+}
+
+.targetPill span,
+.targetPill em {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--text-3);
+  font-style: normal;
+  text-transform: uppercase;
+}
+
+.targetPill strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
 .riskScore {
   min-width: 86px;
   aspect-ratio: 1;
@@ -753,6 +791,11 @@ h1, h2, h3, h4 {
   align-items: center;
   gap: 8px;
   color: var(--text-2);
+}
+
+.reviewTitle {
+  margin-top: 16px;
+  color: var(--text-3);
 }
 
 .badge,

@@ -2,6 +2,7 @@ import ast
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -12,7 +13,14 @@ from pydantic import BaseModel
 
 from coral_mcp_client import CoralMCPClient, CoralMCPError, mcp_discovery_enabled
 from coral_client import CoralClient, CoralClientError, load_dotenv
-from llm_orchestrator import LLMPlannerError, plan_with_openrouter
+from llm_orchestrator import (
+    LLMPlannerError,
+    extract_package_candidates_with_openrouter,
+    plan_with_openrouter,
+    build_dynamic_investigation_payload,
+    openrouter_chat_tools,
+)
+
 
 load_dotenv()
 
@@ -54,6 +62,14 @@ def env_truthy(name: str) -> bool:
 
 def fixtures_enabled() -> bool:
     return env_truthy("HARBORGUARD_USE_FIXTURES")
+
+
+def github_alerts_enabled() -> bool:
+    return env_truthy("HARBORGUARD_ENABLE_GITHUB_ALERTS")
+
+
+def github_query_timeout() -> float:
+    return float(os.getenv("HARBORGUARD_GITHUB_QUERY_TIMEOUT_SECONDS", "10"))
 
 
 def load_fixture(name: str) -> dict[str, object] | None:
@@ -125,10 +141,10 @@ class AgentInvestigationReq(BaseModel):
     org: str | None = None
     slack_channel: str | None = None
     policy_query: str = "dependency security review secrets access control"
-    package_system: str = "NPM"
-    package_ecosystem: str = "npm"
-    package_name: str = "minimist"
-    package_version: str = "0.0.8"
+    package_system: str | None = None
+    package_ecosystem: str | None = None
+    package_name: str | None = None
+    package_version: str | None = None
     days: int = 7
 
 
@@ -148,6 +164,13 @@ INVESTIGATION_TOOLS = {
         "purpose": "Inspect GitHub Dependabot alerts for known vulnerabilities.",
         "capabilities": ["dependabot_alerts", "known_vulnerability_detection"],
         "step": "github_dependabot_alerts",
+    },
+    "github.commits": {
+        "source": "github",
+        "kind": "table",
+        "purpose": "Inspect recent commit messages for dependency changes.",
+        "capabilities": ["change_risk", "dependency_change_detection"],
+        "step": "github_recent_commits",
     },
     "github.search_code": {
         "source": "github",
@@ -218,6 +241,497 @@ def deps_dev_advisories_sql(advisory_keys: list[str]) -> str | None:
     WHERE advisory_id IN ({key_list})
     LIMIT 20
     """
+
+
+ECOSYSTEM_TO_DEPS_SYSTEM = {
+    "npm": "NPM",
+    "javascript": "NPM",
+    "node": "NPM",
+    "pypi": "PYPI",
+    "pip": "PYPI",
+    "python": "PYPI",
+    "go": "GO",
+    "golang": "GO",
+    "maven": "MAVEN",
+    "java": "MAVEN",
+    "cargo": "CARGO",
+    "rust": "CARGO",
+    "nuget": "NUGET",
+}
+
+DEPS_SYSTEM_TO_OSV_ECOSYSTEM = {
+    "NPM": "npm",
+    "PYPI": "PyPI",
+    "GO": "Go",
+    "MAVEN": "Maven",
+    "CARGO": "crates.io",
+    "NUGET": "NuGet",
+}
+
+
+def normalize_ecosystem(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"pip", "python"}:
+        return "PyPI"
+    if lowered == "pypi":
+        return "PyPI"
+    if lowered in {"go", "golang"}:
+        return "Go"
+    if lowered in {"cargo", "rust", "crates.io"}:
+        return "crates.io"
+    if lowered == "nuget":
+        return "NuGet"
+    if lowered in {"maven", "java"}:
+        return "Maven"
+    if lowered in {"npm", "javascript", "node"}:
+        return "npm"
+    return text
+
+
+def infer_deps_system(ecosystem: object, explicit_system: object = None) -> str | None:
+    if explicit_system:
+        normalized = str(explicit_system).strip().upper()
+        return normalized or None
+    if not ecosystem:
+        return None
+    key = str(ecosystem).strip().lower()
+    return ECOSYSTEM_TO_DEPS_SYSTEM.get(key)
+
+
+def infer_osv_ecosystem(system: object, ecosystem: object = None) -> str | None:
+    normalized_ecosystem = normalize_ecosystem(ecosystem)
+    if normalized_ecosystem:
+        return normalized_ecosystem
+    if system:
+        return DEPS_SYSTEM_TO_OSV_ECOSYSTEM.get(str(system).strip().upper())
+    return None
+
+
+def normalize_version(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().strip("`'\",;)")
+    if not text:
+        return None
+    if text.lower() in {"latest", "current", "unknown", "none", "null"}:
+        return None
+    return text
+
+
+PACKAGE_NAME_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "app",
+    "build",
+    "change",
+    "changes",
+    "dependency",
+    "dependencies",
+    "deps",
+    "feature",
+    "fix",
+    "from",
+    "helper",
+    "into",
+    "it",
+    "lock",
+    "package",
+    "release",
+    "source",
+    "sources",
+    "support",
+    "this",
+    "up",
+    "use",
+    "using",
+}
+
+
+def is_plausible_package_name(value: str) -> bool:
+    name = value.strip().strip("`'\",")
+    lowered = name.lower()
+    if not name or lowered in PACKAGE_NAME_STOPWORDS:
+        return False
+    if len(name) < 2:
+        return False
+    return bool(
+        "/" in name
+        or ":" in name
+        or "-" in name
+        or "_" in name
+        or "." in name
+        or name.startswith("@")
+        or any(char.isalpha() for char in name)
+    )
+
+
+def is_plausible_dependency_version(value: str | None) -> bool:
+    if not value:
+        return False
+    version = value.strip().lstrip("v")
+    if version.isdigit():
+        return False
+    return bool(re.search(r"\d+\.\d+", version) or re.search(r"\d+[a-zA-Z-]+\d*", version))
+
+
+def normalize_package_candidate(candidate: dict[str, object]) -> dict[str, object] | None:
+    package_name = str(candidate.get("package_name") or "").strip().strip("`'\",")
+    if not is_plausible_package_name(package_name):
+        return None
+
+    version = normalize_version(candidate.get("version"))
+    if version and not is_plausible_dependency_version(version):
+        version = None
+    ecosystem = infer_osv_ecosystem(candidate.get("system"), candidate.get("ecosystem"))
+    system = infer_deps_system(ecosystem, candidate.get("system"))
+    confidence = candidate.get("confidence")
+    try:
+        confidence_float = float(confidence)
+    except (TypeError, ValueError):
+        confidence_float = 0.5
+
+    return {
+        "package_name": package_name,
+        "version": version,
+        "previous_version": normalize_version(candidate.get("previous_version")),
+        "ecosystem": ecosystem,
+        "system": system,
+        "confidence": max(0.0, min(confidence_float, 1.0)),
+        "source": str(candidate.get("source") or "unknown"),
+        "reason": str(candidate.get("reason") or "Package candidate discovered."),
+        "evidence": candidate.get("evidence"),
+    }
+
+
+def request_override_candidate(req: AgentInvestigationReq) -> dict[str, object] | None:
+    if not req.package_name:
+        return None
+    candidate = normalize_package_candidate(
+        {
+            "package_name": req.package_name,
+            "version": req.package_version,
+            "system": req.package_system,
+            "ecosystem": req.package_ecosystem,
+            "confidence": 1.0,
+            "source": "user_override",
+            "reason": "Advanced package override was provided in the request.",
+        }
+    )
+    if candidate and not candidate.get("version"):
+        candidate["reason"] = "Advanced package override provided a package name without an exact version."
+    return candidate
+
+
+DEPENDENCY_PATTERNS = [
+    re.compile(
+        r"\b(?:bump|bumped|upgrade|upgraded|update|updated)\s+"
+        r"(?P<package>@?[\w][\w./:@+-]*?)\s+"
+        r"(?:from\s+(?P<from>v?\d[\w.+:-]*)\s+)?to\s+(?P<to>v?\d[\w.+:-]*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:bump|bumped|upgrade|upgraded|update|updated)\s+"
+        r"(?P<package>@?[\w][\w./:@+-]*?)\s+"
+        r"(?:=>|->)\s+(?P<to>v?\d[\w.+:-]*)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def ecosystem_from_text(text: str) -> str | None:
+    lowered = text.lower()
+    if any(token in lowered for token in ("package.json", "package-lock", "npm", "yarn", "pnpm")):
+        return "npm"
+    if any(token in lowered for token in ("requirements.txt", "pyproject", "pip", "pypi")):
+        return "PyPI"
+    if any(token in lowered for token in ("go.mod", "golang", "go module")):
+        return "Go"
+    if any(token in lowered for token in ("pom.xml", "maven", "gradle")):
+        return "Maven"
+    if any(token in lowered for token in ("cargo.toml", "cargo.lock", "crate")):
+        return "crates.io"
+    if any(token in lowered for token in ("nuget", ".csproj", "packages.config")):
+        return "NuGet"
+    return None
+
+
+def extract_candidates_from_pulls(pull_rows: list[dict]) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    for row in pull_rows:
+        title = str(row.get("title") or "")
+        body = str(row.get("body") or "")
+        text = f"{title}\n{body[:1200]}"
+        ecosystem = ecosystem_from_text(text)
+        for pattern in DEPENDENCY_PATTERNS:
+            for match in pattern.finditer(text):
+                package_name = match.group("package").strip("`'\",")
+                if not is_plausible_package_name(package_name):
+                    continue
+                candidate = normalize_package_candidate(
+                    {
+                        "package_name": package_name,
+                        "version": match.group("to"),
+                        "previous_version": match.groupdict().get("from"),
+                        "ecosystem": ecosystem,
+                        "confidence": 0.82 if ecosystem else 0.68,
+                        "source": "github.pulls",
+                        "reason": f"PR #{row.get('number')} mentions {package_name} upgraded to {match.group('to')}.",
+                        "evidence": {
+                            "pull_number": row.get("number"),
+                            "title": title,
+                            "url": row.get("html_url") or row.get("url"),
+                        },
+                    }
+                )
+                if candidate:
+                    candidates.append(candidate)
+    return candidates
+
+
+def extract_candidates_from_commits(commit_rows: list[dict]) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    for row in commit_rows:
+        message = str(row.get("commit__message") or "")
+        first_line = message.splitlines()[0] if message else ""
+        ecosystem = ecosystem_from_text(message)
+        for pattern in DEPENDENCY_PATTERNS:
+            for match in pattern.finditer(message[:1500]):
+                package_name = match.group("package").strip("`'\",")
+                if not is_plausible_package_name(package_name):
+                    continue
+                candidate = normalize_package_candidate(
+                    {
+                        "package_name": package_name,
+                        "version": match.group("to"),
+                        "previous_version": match.groupdict().get("from"),
+                        "ecosystem": ecosystem,
+                        "confidence": 0.78 if ecosystem else 0.62,
+                        "source": "github.commits",
+                        "reason": f"Commit {str(row.get('sha') or '')[:7]} mentions {package_name} upgraded to {match.group('to')}.",
+                        "evidence": {
+                            "sha": row.get("sha"),
+                            "message": first_line,
+                            "url": row.get("html_url"),
+                        },
+                    }
+                )
+                if candidate:
+                    candidates.append(candidate)
+    return candidates
+
+
+def alert_candidate_version(row: dict) -> str | None:
+    for key in (
+        "dependency__package__version",
+        "dependency__version",
+        "vulnerable_version_range",
+        "security_vulnerability__vulnerable_version_range",
+    ):
+        version = normalize_version(row.get(key))
+        if version and not any(char in version for char in "<>=|,* "):
+            return version
+    return None
+
+
+def extract_candidates_from_alerts(alert_rows: list[dict]) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    for row in alert_rows:
+        package_name = row.get("dependency__package__name")
+        if not package_name:
+            continue
+        severity = str(row.get("security_advisory__severity") or "medium").lower()
+        severity_boost = {
+            "critical": 0.22,
+            "high": 0.16,
+            "medium": 0.1,
+            "moderate": 0.1,
+            "low": 0.04,
+        }.get(severity, 0.08)
+        candidate = normalize_package_candidate(
+            {
+                "package_name": package_name,
+                "version": alert_candidate_version(row),
+                "ecosystem": row.get("dependency__package__ecosystem"),
+                "confidence": 0.58 + severity_boost,
+                "source": "github.alerts",
+                "reason": f"Open Dependabot alert reports {package_name} with {severity} severity.",
+                "evidence": {
+                    "alert_number": row.get("number"),
+                    "summary": row.get("security_advisory__summary"),
+                    "url": row.get("html_url"),
+                },
+            }
+        )
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def dedupe_candidates(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+    deduped: dict[tuple[object, object, object], dict[str, object]] = {}
+    for candidate in candidates:
+        normalized = normalize_package_candidate(candidate)
+        if not normalized:
+            continue
+        key = (
+            normalized.get("package_name"),
+            normalized.get("version"),
+            normalized.get("system") or normalized.get("ecosystem"),
+        )
+        existing = deduped.get(key)
+        if not existing or float(normalized["confidence"]) > float(existing["confidence"]):
+            deduped[key] = normalized
+    return sorted(
+        deduped.values(),
+        key=lambda item: (
+            bool(item.get("version")),
+            bool(item.get("system")),
+            float(item.get("confidence") or 0),
+        ),
+        reverse=True,
+    )
+
+
+def extract_package_target(
+    req: AgentInvestigationReq,
+    pull_step: dict[str, object],
+    alert_step: dict[str, object],
+    commit_step: dict[str, object] | None = None,
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    started_at = time.perf_counter()
+    pull_rows = first_rows(pull_step, limit=20)
+    alert_rows = first_rows(alert_step, limit=20)
+    commit_rows = first_rows(commit_step or {}, limit=20)
+    trace: list[str] = []
+    llm_status: dict[str, object] = {"used": False}
+
+    override = request_override_candidate(req)
+    if override:
+        candidates = [override]
+        trace.append("Used advanced package override from the request.")
+    else:
+        deterministic_candidates = [
+            *extract_candidates_from_pulls(pull_rows),
+            *extract_candidates_from_commits(commit_rows),
+            *extract_candidates_from_alerts(alert_rows),
+        ]
+        candidates = list(deterministic_candidates)
+        trace.append(
+            f"Deterministic extraction found {len(deterministic_candidates)} package candidate(s)."
+        )
+
+        try:
+            llm_result = extract_package_candidates_with_openrouter(
+                req,
+                pull_rows,
+                alert_rows,
+                deterministic_candidates,
+                commit_rows,
+            )
+            llm_candidates = [
+                candidate
+                for candidate in (
+                    normalize_package_candidate(item)
+                    for item in llm_result.get("candidates", [])
+                    if isinstance(item, dict)
+                )
+                if candidate
+            ]
+            candidates = [*llm_candidates, *candidates]
+            llm_status = {
+                "used": True,
+                "model": llm_result.get("model"),
+                "duration_ms": llm_result.get("duration_ms"),
+                "candidate_count": len(llm_candidates),
+            }
+            trace.append(f"LLM extraction returned {len(llm_candidates)} package candidate(s).")
+        except LLMPlannerError as error:
+            llm_status = {
+                "used": False,
+                "error": str(error),
+            }
+            trace.append(f"LLM extraction skipped or failed: {error}.")
+
+    candidates = dedupe_candidates(candidates)
+    selected = candidates[0] if candidates else None
+    if selected:
+        trace.append(
+            "Selected "
+            f"{selected.get('package_name')}@{selected.get('version') or 'unknown version'} "
+            f"from {selected.get('source')}."
+        )
+    else:
+        trace.append("No exact dependency target was discovered from repository context.")
+
+    return selected, {
+        "candidates": candidates,
+        "selected": selected,
+        "trace": trace,
+        "llm": llm_status,
+        "duration_ms": elapsed_ms(started_at),
+    }
+
+
+def package_extraction_step(extraction: dict[str, object]) -> dict[str, object]:
+    return {
+        "name": "package_target_extraction",
+        "ok": True,
+        "rows": extraction.get("candidates", []),
+        "sql": None,
+        "error": None,
+        "duration_ms": int(extraction.get("duration_ms") or 0),
+        "selected": extraction.get("selected"),
+        "llm": extraction.get("llm"),
+    }
+
+
+def build_package_sql(
+    target: dict[str, object],
+) -> dict[str, str | None]:
+    package_name = sql_string(str(target.get("package_name") or ""))
+    version = sql_string(str(target.get("version") or ""))
+    system = sql_string(str(target.get("system") or ""))
+    ecosystem = sql_string(str(target.get("ecosystem") or ""))
+
+    if not package_name or not version or not system:
+        return {
+            "deps_version": None,
+            "deps_dependencies": None,
+            "osv_version": None,
+        }
+
+    return {
+        "deps_version": f"""
+        SELECT version, published_at, licenses, advisory_keys, related_projects, links
+        FROM deps_dev.versions
+        WHERE system = '{system}'
+          AND package_name = '{package_name}'
+          AND version = '{version}'
+        LIMIT 1
+        """,
+        "deps_dependencies": f"""
+        SELECT dependency_name, dependency_version, relation
+        FROM deps_dev.dependencies
+        WHERE system = '{system}'
+          AND package_name = '{package_name}'
+          AND version = '{version}'
+        LIMIT 20
+        """,
+        "osv_version": f"""
+        SELECT id, summary, severity, references
+        FROM osv.query_by_version
+        WHERE package_name = '{package_name}'
+          AND ecosystem = '{ecosystem}'
+          AND version = '{version}'
+        LIMIT 20
+        """ if ecosystem else None,
+    }
 
 
 def query_step(name: str, sql: str) -> dict[str, object]:
@@ -890,7 +1404,8 @@ def plan_investigation(
             return
 
         if tool_available(capabilities, tool_name):
-            selected_tools.append(tool_name)
+            if tool_name not in selected_tools:
+                selected_tools.append(tool_name)
             trace.append(f"Selected {tool_name}: {reason}.")
         else:
             skipped_tools.append(
@@ -918,9 +1433,15 @@ def plan_investigation(
 
     if wants_change or wants_policy:
         consider("github.pulls", "question needs recent code/change context")
+        consider("github.commits", "question needs recent commit context")
 
     if wants_dependency:
-        consider("github.alerts", "question needs GitHub dependency alert context")
+        consider(
+            "github.alerts",
+            "GitHub Dependabot org alerts are disabled by default",
+            required=github_alerts_enabled(),
+        )
+        consider("github.commits", "question needs dependency change context")
         consider("deps_dev.versions", "question needs package metadata")
         consider("deps_dev.dependencies", "question needs dependency context")
         consider("deps_dev.advisories", "question needs advisory detail")
@@ -985,10 +1506,19 @@ def validate_plan(
                 {"tool": tool, "reason": "tool is not available in Coral metadata"}
             )
             continue
+        if tool == "github.alerts" and not github_alerts_enabled():
+            skipped_tools.append(
+                {
+                    "tool": tool,
+                    "reason": "GitHub Dependabot org alerts are disabled by default",
+                }
+            )
+            continue
         if tool == "slack.messages" and not req.slack_channel:
             skipped_tools.append({"tool": tool, "reason": "slack_channel was not provided"})
             continue
-        selected_tools.append(tool)
+        if tool not in selected_tools:
+            selected_tools.append(tool)
 
     if not selected_tools:
         fallback = plan_investigation(req, capabilities)
@@ -1097,7 +1627,7 @@ def build_agent_findings(
         advisory_keys,
     )
 
-    if evidence:
+    if evidence and package_risk["score"] >= 10:
         findings.append(
             {
                 "type": "vulnerable_dependency",
@@ -1129,56 +1659,6 @@ def build_agent_findings(
             }
         )
 
-    risky_keywords = (
-        "auth",
-        "token",
-        "secret",
-        "password",
-        "permission",
-        "admin",
-        "iam",
-        "package",
-        "dependency",
-        "lock",
-        "terraform",
-        ".env",
-    )
-    pull_rows = first_rows(by_name["github_recent_pulls"], limit=20)
-
-    def _risky_keyword_count(row: dict) -> int:
-        text = f"{row.get('title', '')} {row.get('body', '')} {row.get('label_names', '')}".lower()
-        return sum(1 for word in risky_keywords if word in text)
-
-    risky_pulls = [
-        (row, _risky_keyword_count(row))
-        for row in pull_rows
-        if _risky_keyword_count(row) > 0
-    ]
-    # Sort by keyword count descending so the riskiest PRs surface first
-    risky_pulls.sort(key=lambda item: item[1], reverse=True)
-
-    if risky_pulls:
-        # Score scales: 25 base + 5 per keyword hit across all risky PRs, capped at 65
-        total_hits = sum(count for _, count in risky_pulls)
-        pr_score = min(25 + total_hits * 5, 65)
-        findings.append(
-            {
-                "type": "risky_change",
-                "title": f"{len(risky_pulls)} recent merged pull request(s) mention sensitive areas",
-                "severity": level_from_score(pr_score),
-                "score": pr_score,
-                "evidence": [
-                    {
-                        "source": "github.pulls",
-                        "text": f"PR #{row.get('number')}: {row.get('title')}",
-                        "url": row.get("html_url") or row.get("url"),
-                    }
-                    for row, _ in risky_pulls[:5]
-                ],
-                "recommendation": "Ask the security reviewer to inspect these changes.",
-            }
-        )
-
     policy_rows = first_rows(by_name["notion_policy_context"], limit=3)
     slack_rows = first_rows(by_name["slack_security_discussion"], limit=3)
     for finding in findings:
@@ -1202,6 +1682,182 @@ def build_agent_findings(
     return sorted(findings, key=lambda item: int(item["score"]), reverse=True)
 
 
+SENSITIVE_REVIEW_KEYWORDS = (
+    "oauth",
+    "auth",
+    "authentication",
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "permission",
+    "admin",
+    "iam",
+    "terraform",
+    ".env",
+)
+
+DEPENDENCY_REVIEW_KEYWORDS = (
+    "dependency",
+    "dependencies",
+    "package-lock",
+    "pnpm-lock",
+    "yarn.lock",
+    "lockfile",
+)
+
+
+def matched_review_keywords(text: str, include_dependency_words: bool) -> list[str]:
+    lowered = text.lower()
+    keywords = list(SENSITIVE_REVIEW_KEYWORDS)
+    if include_dependency_words:
+        keywords.extend(DEPENDENCY_REVIEW_KEYWORDS)
+
+    matches: list[str] = []
+    for keyword in keywords:
+        if keyword == ".env":
+            matched = keyword in lowered
+        elif any(char in keyword for char in ".-"):
+            matched = keyword in lowered
+        else:
+            matched = bool(re.search(rf"\b{re.escape(keyword)}\b", lowered))
+        if matched:
+            matches.append(keyword)
+    return matches
+
+
+def pull_request_state(row: dict) -> str:
+    state = str(row.get("state") or "").lower()
+    if state == "open":
+        return "open"
+    if row.get("merged_at"):
+        return "merged"
+    if state == "closed":
+        return "closed"
+    return "unknown"
+
+
+def build_review_signals(
+    req: AgentInvestigationReq,
+    steps: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    by_name = {str(step["name"]): step for step in steps}
+    pull_rows = first_rows(by_name.get("github_recent_pulls", {}), limit=20)
+    include_dependency_words = bool(req.package_name and req.package_version)
+
+    matched_pulls = []
+    for row in pull_rows:
+        text = f"{row.get('title', '')} {row.get('body', '')} {row.get('label_names', '')}"
+        matches = matched_review_keywords(text, include_dependency_words)
+        if matches:
+            matched_pulls.append((row, matches, pull_request_state(row)))
+
+    signals = []
+
+    osv_step = step_by_name(steps, "osv_package_vulnerabilities")
+    if osv_step and osv_step.get("ok"):
+        rows = osv_step.get("rows")
+        if isinstance(rows, list) and not rows and req.package_name:
+            signals.append({
+                "type": "clean_bill_of_health",
+                "title": f"Dependency Deep Scan Passed: No confirmed vulnerabilities found for {req.package_name}@{req.package_version}.",
+                "severity": "informational",
+                "score": 0,
+                "evidence": [
+                    {
+                        "source": "osv.query_by_version",
+                        "text": "The target dependency package was scanned against OSV and deps.dev, and no vulnerabilities were found. This package appears to be safe.",
+                        "url": None
+                    }
+                ],
+                "recommendation": "No action required. The package passed the deep scan."
+            })
+
+    if matched_pulls:
+        matched_pulls.sort(key=lambda item: (item[2] == "merged", len(item[1])), reverse=True)
+        merged_count = sum(1 for _, _, state in matched_pulls if state == "merged")
+        open_count = sum(1 for _, _, state in matched_pulls if state == "open")
+        signal_score = min(10 + len(matched_pulls) * 3, 25)
+        title_parts = []
+        if merged_count:
+            title_parts.append(f"{merged_count} merged")
+        if open_count:
+            title_parts.append(f"{open_count} open")
+        title_prefix = " and ".join(title_parts) or str(len(matched_pulls))
+
+        signals.append(
+            {
+                "type": "change_review_signal",
+                "title": f"{title_prefix} pull request(s) mention security-sensitive terms",
+                "severity": "informational",
+                "score": signal_score,
+                "evidence": [
+                    {
+                        "source": "github.pulls",
+                        "text": (
+                            f"PR #{row.get('number')} [{state}]: {row.get('title')} "
+                            f"(matched: {', '.join(matches)})"
+                        ),
+                        "url": row.get("html_url") or row.get("url"),
+                    }
+                    for row, matches, state in matched_pulls[:5]
+                ],
+                "recommendation": (
+                    "Review these PRs for context. This signal does not count as confirmed vulnerability evidence."
+                ),
+            }
+        )
+
+    for step in steps:
+        if step.get("is_dynamic") and step.get("ok") and step.get("rows"):
+            rows = step.get("rows")
+            if not isinstance(rows, list) or not rows:
+                continue
+                
+            def format_row(r):
+                parts = []
+                for k, v in r.items():
+                    if v is None or k in ("url", "html_url"):
+                        continue
+                    val_str = str(v)
+                    if val_str.startswith("{"):
+                        try:
+                            import json
+                            parsed = json.loads(val_str)
+                            if isinstance(parsed, dict):
+                                if "login" in parsed:
+                                    val_str = parsed["login"]
+                                elif "name" in parsed:
+                                    val_str = parsed["name"]
+                                else:
+                                    val_str = "{...}"
+                        except Exception:
+                            pass
+                    if len(val_str) > 50:
+                        val_str = val_str[:47] + "..."
+                    parts.append(f"{k}: {val_str}")
+                txt = " | ".join(parts)
+                return txt[:200] + "..." if len(txt) > 200 else txt
+                
+            signals.append({
+                "type": "dynamic_investigation",
+                "title": f"Dynamic Query: {step.get('purpose', 'Ad-hoc investigation')}",
+                "severity": "informational",
+                "score": 15,
+                "evidence": [
+                    {
+                        "source": "llm.dynamic_sql",
+                        "text": format_row(row),
+                        "url": row.get("html_url") or row.get("url") or None,
+                    }
+                    for row in rows[:5]
+                ],
+                "recommendation": "Review these LLM-generated dynamic SQL query results for anomalies."
+            })
+
+    return signals
+
+
 def build_evidence_graph(
     req: AgentInvestigationReq,
     findings: list[dict[str, object]],
@@ -1209,13 +1865,21 @@ def build_evidence_graph(
     nodes: dict[str, dict[str, object]] = {}
     edges: list[dict[str, object]] = []
 
-    # Narrative-driven causal graph construction
-    package_id = f"pkg:{req.package_ecosystem}:{req.package_name}:{req.package_version}"
-    nodes[package_id] = {
-        "id": package_id,
-        "type": "package",
-        "label": f"{req.package_name}@{req.package_version}",
-    }
+    # Narrative-driven causal graph construction. A package node is only present
+    # when the repo-first extraction phase found a concrete target.
+    package_id = None
+    if req.package_name:
+        package_label = (
+            f"{req.package_name}@{req.package_version}"
+            if req.package_version
+            else str(req.package_name)
+        )
+        package_id = f"pkg:{req.package_ecosystem or 'unknown'}:{req.package_name}:{req.package_version or 'unknown'}"
+        nodes[package_id] = {
+            "id": package_id,
+            "type": "package",
+            "label": package_label,
+        }
 
     for index, finding in enumerate(findings, start=1):
         # We DO NOT create a finding node in the graph anymore.
@@ -1298,11 +1962,13 @@ def build_evidence_graph(
         # Build causality
         # 1. Sources -> Package
         for src_id in source_nodes:
-            edges.append({"from": src_id, "to": package_id, "type": "introduced"})
+            if package_id:
+                edges.append({"from": src_id, "to": package_id, "type": "introduced"})
             
         # 2. Package -> Vulnerabilities
         for v_id in vuln_nodes:
-            edges.append({"from": package_id, "to": v_id, "type": "matched"})
+            if package_id:
+                edges.append({"from": package_id, "to": v_id, "type": "matched"})
             
         # 3. Vulnerabilities -> Other Evidence
         # If no vuln, Package -> Other Evidence
@@ -1310,7 +1976,7 @@ def build_evidence_graph(
             if vuln_nodes:
                 for v_id in vuln_nodes:
                     edges.append({"from": v_id, "to": ev_id, "type": "documented_by"})
-            else:
+            elif package_id:
                 edges.append({"from": package_id, "to": ev_id, "type": "supported_by"})
                 
         # Policies
@@ -1329,7 +1995,7 @@ def build_evidence_graph(
             if vuln_nodes:
                 for v_id in vuln_nodes:
                     edges.append({"from": v_id, "to": policy_id, "type": "violates"})
-            else:
+            elif package_id:
                 edges.append({"from": package_id, "to": policy_id, "type": "violates"})
                 
         # Discussions
@@ -1344,7 +2010,8 @@ def build_evidence_graph(
                 "source": discussion.get("source"),
             }
             # Discussion connects to Package
-            edges.append({"from": package_id, "to": discussion_id, "type": "discussed_in"})
+            if package_id:
+                edges.append({"from": package_id, "to": discussion_id, "type": "discussed_in"})
 
     # Deduplicate edges
     seen_edges = set()
@@ -1421,6 +2088,33 @@ def sum_step_durations(steps: object) -> int:
         int(step.get("duration_ms") or 0)
         for step in steps
         if isinstance(step, dict)
+    )
+
+
+def build_assessment_answer(
+    finding_count: int,
+    review_signal_count: int,
+    target_text: str,
+) -> str:
+    target_suffix = f" Target: {target_text}."
+    if finding_count:
+        if review_signal_count:
+            return (
+                f"HarborGuard found {finding_count} confirmed security or compliance "
+                f"finding(s) and {review_signal_count} review signal(s).{target_suffix}"
+            )
+        return (
+            f"HarborGuard found {finding_count} confirmed security or compliance "
+            f"finding(s).{target_suffix}"
+        )
+    if review_signal_count:
+        return (
+            "HarborGuard found no confirmed vulnerability evidence, but found "
+            f"{review_signal_count} PR review signal(s).{target_suffix}"
+        )
+    return (
+        "HarborGuard did not find high-confidence risk evidence in the configured "
+        f"sources.{target_suffix}"
     )
 
 
@@ -1678,21 +2372,24 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
     owner = sql_string(req.owner)
     repo = sql_string(req.repo)
     org = sql_string(req.org or req.owner)
-    package_name = sql_string(req.package_name)
-    package_version = sql_string(req.package_version)
-    package_system = sql_string(req.package_system)
-    package_ecosystem = sql_string(req.package_ecosystem)
     policy_query = sql_string(req.policy_query)
 
     github_recent_pulls_sql = f"""
-    SELECT number, title, body, user__login, merged_at, url, label_names
+    SELECT number, title, body, state, user__login, created_at, updated_at, merged_at, html_url, url
     FROM github.pulls
     WHERE owner = '{owner}'
       AND repo = '{repo}'
-      AND state = 'closed'
-      AND merged_at IS NOT NULL
-    ORDER BY merged_at DESC
-    LIMIT 20
+      AND state = 'all'
+      AND sort = 'updated'
+      AND direction = 'desc'
+    LIMIT 8
+    """
+    github_recent_commits_sql = f"""
+    SELECT sha, commit__message, commit__author__date, commit__committer__date, html_url
+    FROM github.commits
+    WHERE owner = '{owner}'
+      AND repo = '{repo}'
+    LIMIT 12
     """
     github_dependabot_alerts_sql = f"""
     SELECT number, state, dependency__package__ecosystem, dependency__package__name,
@@ -1707,30 +2404,6 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
     FROM github.search_code(q => 'repo:{owner}/{repo} filename:.env')
     LIMIT 10
     """
-    deps_dev_package_version_sql = f"""
-    SELECT version, published_at, licenses, advisory_keys, related_projects, links
-    FROM deps_dev.versions
-    WHERE system = '{package_system}'
-      AND package_name = '{package_name}'
-      AND version = '{package_version}'
-    LIMIT 1
-    """
-    deps_dev_dependencies_sql = f"""
-    SELECT dependency_name, dependency_version, relation
-    FROM deps_dev.dependencies
-    WHERE system = '{package_system}'
-      AND package_name = '{package_name}'
-      AND version = '{package_version}'
-    LIMIT 20
-    """
-    osv_package_vulnerabilities_sql = f"""
-    SELECT id, summary, severity, references
-    FROM osv.query_by_version
-    WHERE package_name = '{package_name}'
-      AND ecosystem = '{package_ecosystem}'
-      AND version = '{package_version}'
-    LIMIT 20
-    """
     notion_policy_context_sql = f"""
     SELECT id, object, url, public_url, raw
     FROM notion.search
@@ -1743,46 +2416,133 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
     plan = plan_with_orchestrator(req, capabilities)
     selected_tools = set(plan["selected_tools"])
 
-    runnable_steps = {
-        "github.pulls": ("github_recent_pulls", github_recent_pulls_sql),
-        "github.alerts": ("github_dependabot_alerts", github_dependabot_alerts_sql),
-        "github.search_code": (
-            "github_secret_file_search",
-            github_secret_file_search_sql,
-        ),
-        "deps_dev.versions": ("deps_dev_package_version", deps_dev_package_version_sql),
-        "deps_dev.dependencies": (
-            "deps_dev_dependencies",
-            deps_dev_dependencies_sql,
-        ),
-        "osv.query_by_version": (
-            "osv_package_vulnerabilities",
-            osv_package_vulnerabilities_sql,
-        ),
-        "notion.search": ("notion_policy_context", notion_policy_context_sql),
-    }
+    steps: list[dict[str, object]] = []
 
-    steps = []
-    for tool_name, (step_name, sql) in runnable_steps.items():
-        if tool_name in selected_tools:
-            steps.append(query_step(step_name, sql))
+    # Phase 1: always discover repository context first. This is what lets the
+    # agent infer the package target from the repo instead of relying on defaults.
+    github_timeout = github_query_timeout()
+    if tool_available(capabilities, "github.pulls"):
+        github_pulls_step = query_step_with_timeout(
+            "github_recent_pulls",
+            github_recent_pulls_sql,
+            github_timeout,
+        )
+    else:
+        github_pulls_step = skipped_step(
+            "github_recent_pulls",
+            "github.pulls is not available in Coral metadata",
+        )
+    steps.append(github_pulls_step)
+
+    if tool_available(capabilities, "github.commits"):
+        github_commits_step = query_step_with_timeout(
+            "github_recent_commits",
+            github_recent_commits_sql,
+            github_timeout,
+        )
+    else:
+        github_commits_step = skipped_step(
+            "github_recent_commits",
+            "github.commits is not available in Coral metadata",
+        )
+    steps.append(github_commits_step)
+
+    if github_alerts_enabled() and tool_available(capabilities, "github.alerts"):
+        github_alerts_step = query_step_with_timeout(
+            "github_dependabot_alerts",
+            github_dependabot_alerts_sql,
+            github_timeout,
+        )
+    else:
+        github_alerts_step = skipped_step(
+            "github_dependabot_alerts",
+            "GitHub Dependabot org alerts are disabled by default because the org endpoint often returns 404 without matching permissions",
+        )
+    steps.append(github_alerts_step)
+
+    # Phase 2: extract target package/version from PRs and alerts.
+    package_target, extraction = extract_package_target(
+        req,
+        github_pulls_step,
+        github_alerts_step,
+        github_commits_step,
+    )
+    steps.append(package_extraction_step(extraction))
+
+    deep_scan_target = (
+        package_target
+        if package_target
+        and package_target.get("package_name")
+        and package_target.get("version")
+        and package_target.get("system")
+        else None
+    )
+
+    analysis_req = req
+    if deep_scan_target:
+        analysis_req = req.model_copy(
+            update={
+                "package_name": deep_scan_target.get("package_name"),
+                "package_version": deep_scan_target.get("version"),
+                "package_system": deep_scan_target.get("system"),
+                "package_ecosystem": deep_scan_target.get("ecosystem"),
+            }
+        )
+    selected_package_text = (
+        f"{deep_scan_target.get('package_name')}@{deep_scan_target.get('version')}"
+        if deep_scan_target
+        else "none"
+    )
+    logger.info("agent.package_target.selected target=%s", selected_package_text)
+
+    # Phase 3: run deep package analysis only after a real target is known.
+    if deep_scan_target:
+        package_sql = build_package_sql(deep_scan_target)
+        if package_sql["deps_version"] and tool_available(capabilities, "deps_dev.versions"):
+            steps.append(query_step("deps_dev_package_version", package_sql["deps_version"]))
         else:
-            skipped = next(
-                (
-                    item
-                    for item in plan["skipped_tools"]
-                    if item["tool"] == tool_name
-                ),
-                {"reason": "planner did not select this tool"},
+            steps.append(
+                skipped_step(
+                    "deps_dev_package_version",
+                    "package target did not include enough deps.dev version inputs or tool is unavailable",
+                )
             )
-            steps.append(skipped_step(step_name, skipped["reason"]))
+
+        if package_sql["deps_dependencies"] and tool_available(capabilities, "deps_dev.dependencies"):
+            steps.append(query_step("deps_dev_dependencies", package_sql["deps_dependencies"]))
+        else:
+            steps.append(
+                skipped_step(
+                    "deps_dev_dependencies",
+                    "package target did not include enough deps.dev dependency inputs or tool is unavailable",
+                )
+            )
+
+        if package_sql["osv_version"] and tool_available(capabilities, "osv.query_by_version"):
+            steps.append(query_step("osv_package_vulnerabilities", package_sql["osv_version"]))
+        else:
+            steps.append(
+                skipped_step(
+                    "osv_package_vulnerabilities",
+                    "OSV exact version lookup skipped because package, ecosystem, or version was missing",
+                )
+            )
+    else:
+        reason = (
+            "dependency package was discovered but no exact version was found"
+            if package_target
+            else "no dependency package target was discovered from repository context"
+        )
+        steps.append(skipped_step("deps_dev_package_version", reason))
+        steps.append(skipped_step("deps_dev_dependencies", reason))
+        steps.append(skipped_step("osv_package_vulnerabilities", reason))
 
     deps_version_step = step_by_name(steps, "deps_dev_package_version")
     deps_version_rows = first_rows(deps_version_step or {}, limit=1)
     deps_version = deps_version_rows[0] if deps_version_rows else None
     advisory_keys = advisory_keys_from_version(deps_version)
     advisories_sql = deps_dev_advisories_sql(advisory_keys)
-    if "deps_dev.advisories" in selected_tools:
+    if deep_scan_target and tool_available(capabilities, "deps_dev.advisories"):
         if advisories_sql:
             advisories_step = query_step("deps_dev_advisories", advisories_sql)
         else:
@@ -1791,20 +2551,43 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
                 "deps.dev version metadata did not include advisory keys",
             )
     else:
+        advisories_step = skipped_step(
+            "deps_dev_advisories",
+            "no exact package target was available for advisory expansion",
+        )
+
+    steps.append(advisories_step)
+
+    # Phase 4: run selected contextual enrichments around the repo/package.
+    if "github.search_code" in selected_tools and tool_available(capabilities, "github.search_code"):
+        steps.append(query_step("github_secret_file_search", github_secret_file_search_sql))
+    else:
         skipped = next(
             (
                 item
                 for item in plan["skipped_tools"]
-                if item["tool"] == "deps_dev.advisories"
+                if item["tool"] == "github.search_code"
             ),
             {"reason": "planner did not select this tool"},
         )
-        advisories_step = skipped_step("deps_dev_advisories", skipped["reason"])
+        steps.append(skipped_step("github_secret_file_search", skipped["reason"]))
 
-    steps.append(advisories_step)
+    if "notion.search" in selected_tools and tool_available(capabilities, "notion.search"):
+        steps.append(query_step("notion_policy_context", notion_policy_context_sql))
+    else:
+        skipped = next(
+            (
+                item
+                for item in plan["skipped_tools"]
+                if item["tool"] == "notion.search"
+            ),
+            {"reason": "planner did not select this tool"},
+        )
+        steps.append(skipped_step("notion_policy_context", skipped["reason"]))
 
     if req.slack_channel:
         slack_channel = sql_string(req.slack_channel)
+        package_search_term = sql_string(str(package_target.get("package_name") or "")) if package_target else ""
         slack_security_discussion_sql = f"""
         SELECT user_id, text, ts, thread_ts, reply_count
         FROM slack.messages(channel => '{slack_channel}')
@@ -1812,10 +2595,10 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
            OR text ILIKE '%dependency%'
            OR text ILIKE '%secret%'
            OR text ILIKE '%access%'
-           OR text ILIKE '%{package_name}%'
+           {f"OR text ILIKE '%{package_search_term}%'" if package_search_term else ""}
         LIMIT 20
         """
-        if "slack.messages" in selected_tools:
+        if "slack.messages" in selected_tools and tool_available(capabilities, "slack.messages"):
             steps.append(query_step("slack_security_discussion", slack_security_discussion_sql))
         else:
             skipped = next(
@@ -1838,8 +2621,98 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
         )
         steps.append(skipped_step("slack_security_discussion", skipped["reason"]))
 
-    findings = build_agent_findings(req, steps)
-    evidence_graph = build_evidence_graph(req, findings)
+    # Phase 5: Dynamic LLM Tool Calls (Multi-Turn)
+    import json
+    payload = build_dynamic_investigation_payload(req, capabilities)
+    if payload:
+        turn = 0
+        while turn < 3:
+            turn += 1
+            started_at_t = time.perf_counter()
+            try:
+                tool_calls, raw_message = openrouter_chat_tools(payload, started_at_t, f"llm.dynamic_turn_{turn}")
+            except Exception as e:
+                logger.warning("llm.dynamic_turn.error turn=%s error=%s", turn, e)
+                break
+                
+            if not tool_calls:
+                break
+                
+            payload["messages"].append(raw_message)
+            
+            for i, call in enumerate(tool_calls, start=1):
+                tool_name = call.get("function", {}).get("name")
+                call_id = call.get("id")
+                if not tool_name:
+                    continue
+                    
+                args_str = call.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(args_str)
+                except Exception:
+                    args = {}
+                    
+                original_name = tool_name.replace("_", ".", 1)
+                tool_info = capabilities.get("tools", {}).get(original_name, {})
+                kind = tool_info.get("kind", "table")
+                
+                if kind in ("function", "table_function"):
+                    args_list = []
+                    for k, v in args.items():
+                        args_list.append(f"{k} => '{sql_string(str(v))}'")
+                    args_str_sql = ", ".join(args_list)
+                    sql = f"SELECT * FROM {original_name}({args_str_sql}) LIMIT 10"
+                else:
+                    filters = []
+                    for k, v in args.items():
+                        filters.append(f"{k} = '{sql_string(str(v))}'")
+                    where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
+                    sql = f"SELECT * FROM {original_name}{where_clause} LIMIT 10"
+
+                purpose = f"Dynamic query for {original_name}"
+                step_name = f"dynamic_tool_{turn}_{i}"
+                try:
+                    started_at_q = time.perf_counter()
+                    logger.info("agent.dynamic_tool.start name=%s sql=%s", step_name, compact_sql(sql))
+                    result = coral.query(sql)
+                    duration_ms = elapsed_ms(started_at_q)
+                    steps.append({
+                        "name": step_name,
+                        "ok": True,
+                        "rows": result.rows,
+                        "sql": sql,
+                        "purpose": purpose,
+                        "error": None,
+                        "duration_ms": duration_ms,
+                        "is_dynamic": True,
+                    })
+                    payload["messages"].append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(result.rows[:10])
+                    })
+                    logger.info("agent.dynamic_tool.ok name=%s duration_ms=%s rows=%s", step_name, duration_ms, len(result.rows))
+                except Exception as error:
+                    logger.warning("agent.dynamic_tool.error name=%s error=%s", step_name, error)
+                    steps.append({
+                        "name": step_name,
+                        "ok": False,
+                        "rows": [],
+                        "sql": sql,
+                        "purpose": purpose,
+                        "error": str(error),
+                        "duration_ms": elapsed_ms(started_at_q),
+                        "is_dynamic": True,
+                    })
+                    payload["messages"].append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps({"error": str(error)})
+                    })
+
+    findings = build_agent_findings(analysis_req, steps)
+    review_signals = build_review_signals(analysis_req, steps)
+    evidence_graph = build_evidence_graph(analysis_req, findings)
     max_score = max([int(finding["score"]) for finding in findings], default=0)
     risk_level = level_from_score(max_score)
     failed_steps = [step for step in steps if not step.get("ok")]
@@ -1852,8 +2725,10 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
     )
     reasoning_trace = [
         *plan["reasoning_trace"],
+        "Repository context discovery ran before dependency scanning.",
+        *[str(item) for item in extraction.get("trace", [])],
         f"Executed {len([step for step in steps if not step.get('skipped')])} selected investigation step(s).",
-        f"Generated {len(findings)} finding(s) with maximum score {max_score}.",
+        f"Generated {len(findings)} confirmed finding(s) and {len(review_signals)} review signal(s).",
     ]
     logger.info(
         "endpoint.agent_investigate.done duration_ms=%s risk=%s score=%s findings=%s failed_steps=%s",
@@ -1866,14 +2741,18 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
 
     return {
         "question": req.question,
-        "answer": (
-            f"HarborGuard found {len(findings)} security or compliance finding(s)."
-            if findings
-            else "HarborGuard did not find high-confidence risk evidence in the configured sources."
+        "answer": build_assessment_answer(
+            len(findings),
+            len(review_signals),
+            selected_package_text,
         ),
+        "target_package": deep_scan_target,
+        "package_candidate": package_target,
+        "package_extraction": extraction,
         "risk_level": risk_level,
         "score": max_score,
         "findings": findings,
+        "review_signals": review_signals,
         "evidence_graph": evidence_graph,
         "reasoning_trace": reasoning_trace,
         "planner": plan,

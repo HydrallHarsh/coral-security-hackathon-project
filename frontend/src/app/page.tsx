@@ -35,8 +35,19 @@ type GraphEdge = { from: string; to: string; type: string };
 type EvidenceGraphData = { nodes?: GraphNode[]; edges?: GraphEdge[] };
 type InvestigationResponse = {
   answer?: string; risk_level?: string; score?: number; findings?: Finding[];
+  review_signals?: Finding[];
   planner?: Planner; reasoning_trace?: string[]; evidence_graph?: EvidenceGraphData;
   steps?: Step[]; capability_summary?: Record<string, unknown>;
+  target_package?: {
+    package_name?: string;
+    version?: string | null;
+    ecosystem?: string | null;
+    system?: string | null;
+    confidence?: number;
+    source?: string;
+    reason?: string;
+  } | null;
+  package_extraction?: { candidates?: unknown[]; trace?: string[] };
   source_status?: { ok?: boolean; failed_steps?: Array<{ name: string; error?: string | null }> };
 };
 type InvestigationForm = {
@@ -50,7 +61,7 @@ const initialForm: InvestigationForm = {
   question: "Did dependency upgrades introduce risk and require policy review?",
   owner: "withcoral", repo: "coral", org: "withcoral", slack_channel: "",
   policy_query: "dependency security review secrets access control",
-  package_system: "NPM", package_ecosystem: "npm", package_name: "minimist", package_version: "0.0.8",
+  package_system: "", package_ecosystem: "", package_name: "", package_version: "",
 };
 
 const CASE_PRESETS = [
@@ -126,9 +137,12 @@ export default function Home() {
     const payload = {
       question: form.question, owner: form.owner, repo: form.repo,
       org: form.org || form.owner, slack_channel: form.slack_channel || null,
-      policy_query: form.policy_query, package_system: form.package_system,
-      package_ecosystem: form.package_ecosystem, package_name: form.package_name,
-      package_version: form.package_version, days: 7,
+      policy_query: form.policy_query,
+      package_system: form.package_system || null,
+      package_ecosystem: form.package_ecosystem || null,
+      package_name: form.package_name || null,
+      package_version: form.package_version || null,
+      days: 7,
     };
     try {
       const r = await fetch(`${API_BASE}/agent/investigate`, {
@@ -177,6 +191,7 @@ export default function Home() {
   /* ─── PHASE: RESULTS ─── */
   if (result) {
     const findings = result.findings ?? [];
+    const reviewSignals = result.review_signals ?? [];
     const trace = result.reasoning_trace ?? [];
     const steps = result.steps ?? [];
 
@@ -212,6 +227,16 @@ export default function Home() {
           <div className="aBody">
             <span className="aLabel">Assessment</span>
             <h2 className="aAnswer">{result.answer}</h2>
+            {result.target_package && (
+              <div className="targetPill">
+                <span>Target</span>
+                <strong>
+                  {result.target_package.package_name}
+                  {result.target_package.version ? `@${result.target_package.version}` : ""}
+                </strong>
+                {result.target_package.source && <em>{result.target_package.source}</em>}
+              </div>
+            )}
           </div>
           <div className={`riskScore ${result.risk_level ?? "low"}`}>
             <span className="rsLevel">{result.risk_level ?? "low"}</span>
@@ -232,6 +257,14 @@ export default function Home() {
                 <FindingCard key={f.graph_node_id ?? f.title} finding={f} delay={i * 0.1} />
               ))}
               {findings.length === 0 && <p className="feedEmpty">No findings detected.</p>}
+              {reviewSignals.length > 0 && (
+                <>
+                  <h3 className="secTitle reviewTitle">Review Signals <span className="badge">{reviewSignals.length}</span></h3>
+                  {reviewSignals.map((f, i) => (
+                    <FindingCard key={`signal-${f.graph_node_id ?? f.title}`} finding={f} delay={(i + findings.length) * 0.1} />
+                  ))}
+                </>
+              )}
             </div>
           </aside>
         </div>
@@ -407,12 +440,21 @@ export default function Home() {
           </div>
 
           <details className="cfgDrawer">
-            <summary className="cfgSummary">Configure parameters</summary>
+            <summary className="cfgSummary">Repository scan inputs</summary>
             <div className="cfgGrid">
               <TF label="Owner" value={form.owner} set={v => setForm({ ...form, owner: v })} />
               <TF label="Repository" value={form.repo} set={v => setForm({ ...form, repo: v })} />
               <TF label="Slack channel" value={form.slack_channel} set={v => setForm({ ...form, slack_channel: v })} ph="optional" />
             </div>
+            <details className="advancedDrawer">
+              <summary className="cfgSummary small">Advanced package override</summary>
+              <div className="cfgGrid">
+                <TF label="Package" value={form.package_name} set={v => setForm({ ...form, package_name: v })} ph="auto-detect" />
+                <TF label="Version" value={form.package_version} set={v => setForm({ ...form, package_version: v })} ph="auto-detect" />
+                <TF label="System" value={form.package_system} set={v => setForm({ ...form, package_system: v })} ph="NPM, PYPI, GO" />
+                <TF label="Ecosystem" value={form.package_ecosystem} set={v => setForm({ ...form, package_ecosystem: v })} ph="npm, PyPI, Go" />
+              </div>
+            </details>
           </details>
         </form>
 
