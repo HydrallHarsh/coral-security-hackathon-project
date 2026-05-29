@@ -1,11 +1,15 @@
 import json
+import logging
 import os
 import queue
 import subprocess
 import threading
+import time
 from typing import Any
 
 from coral_client import coral_env, load_dotenv
+
+logger = logging.getLogger("harborguard.mcp")
 
 
 class CoralMCPError(RuntimeError):
@@ -28,6 +32,11 @@ class CoralMCPClient:
         self.reader_thread: threading.Thread | None = None
 
     def __enter__(self) -> "CoralMCPClient":
+        logger.info(
+            "mcp.process.start command=%s timeout=%ss",
+            f"{self.coral_bin} mcp-stdio",
+            f"{self.timeout_seconds:g}",
+        )
         self.process = subprocess.Popen(
             [self.coral_bin, "mcp-stdio"],
             stdin=subprocess.PIPE,
@@ -51,6 +60,7 @@ class CoralMCPClient:
         if not self.process:
             return
 
+        logger.info("mcp.process.stop")
         if self.process.stdin:
             self.process.stdin.close()
         try:
@@ -111,6 +121,8 @@ class CoralMCPClient:
     def _request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         request_id = self.next_id
         self.next_id += 1
+        started_at = time.perf_counter()
+        logger.info("mcp.request.start id=%s method=%s", request_id, method)
         payload = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -118,9 +130,26 @@ class CoralMCPClient:
             "params": params or {},
         }
         self._send(payload)
-        return self._read_response(request_id)
+        try:
+            response = self._read_response(request_id)
+        except CoralMCPError:
+            logger.warning(
+                "mcp.request.failed id=%s method=%s duration_ms=%s",
+                request_id,
+                method,
+                elapsed_ms(started_at),
+            )
+            raise
+        logger.info(
+            "mcp.request.ok id=%s method=%s duration_ms=%s",
+            request_id,
+            method,
+            elapsed_ms(started_at),
+        )
+        return response
 
     def _notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        logger.info("mcp.notify method=%s", method)
         self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})
 
     def _initialize(self) -> None:
@@ -138,6 +167,7 @@ class CoralMCPClient:
         self._notify("notifications/initialized")
 
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        logger.info("mcp.tool.start name=%s", name)
         response = self._request(
             "tools/call",
             {
@@ -150,7 +180,9 @@ class CoralMCPClient:
             raise CoralMCPError("MCP tool response did not include a result object")
         structured = result.get("structuredContent") or result.get("structured_content")
         if isinstance(structured, dict):
+            logger.info("mcp.tool.ok name=%s structured=true", name)
             return structured
+        logger.info("mcp.tool.ok name=%s structured=false", name)
         return result
 
     def list_catalog(
@@ -166,3 +198,7 @@ class CoralMCPClient:
         if kind:
             arguments["kind"] = kind
         return self.call_tool("list_catalog", arguments)
+
+
+def elapsed_ms(started_at: float) -> int:
+    return round((time.perf_counter() - started_at) * 1000)

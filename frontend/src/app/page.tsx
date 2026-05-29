@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { EvidenceGraph } from "./components/EvidenceGraph";
+import { SchemaPanel } from "./components/SchemaPanel";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -90,7 +91,8 @@ export default function Home() {
   const [result, setResult] = useState<InvestigationResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState("trace");
+  const [isSchemaOpen, setIsSchemaOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<"trace" | "execution" | "planner" | "sql" | "raw">("trace");
   const [loadingStep, setLoadingStep] = useState(0);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
 
@@ -192,13 +194,11 @@ export default function Home() {
           </div>
           <div className="tbRight">
             <div className="tbSources">
-              {Object.entries(sources).map(([n, s]) => (
-                <div key={n} className={`tbSrc ${s.available ? "on" : ""}`}>
-                  <span className="tbSrcDot" />
-                  <span className="tbSrcName">{n.replace(/_/g, " ")}</span>
-                </div>
-              ))}
+              {/* Removed sources from top nav as requested */}
             </div>
+            <button className="tbBtn" style={{ background: 'rgba(167, 139, 250, 0.1)', color: '#a78bfa', borderColor: 'rgba(167, 139, 250, 0.3)' }} onClick={() => setIsSchemaOpen(true)}>
+              Coral Schema Intelligence
+            </button>
             <button className="tbBtn" onClick={() => { setResult(null); setError(null); }}>
               ← New Investigation
             </button>
@@ -222,7 +222,6 @@ export default function Home() {
         {/* ─── Main Area ─── */}
         <div className="mainArea">
           <section className="graphPanel">
-            <h3 className="secTitle">Evidence Graph</h3>
             <EvidenceGraph graph={result.evidence_graph} />
           </section>
 
@@ -239,53 +238,123 @@ export default function Home() {
 
         {/* ─── Bottom Dock ─── */}
         <section className="dock">
-          <div className="dockTabs">
-            {(["trace", "execution", "planner"] as const).map(t => (
-              <button key={t} className={`dTab ${activeTab === t ? "active" : ""}`} onClick={() => setActiveTab(t)}>
-                {t === "trace" ? "Reasoning Trace" : t === "execution" ? "Execution Steps" : "Planner"}
-                {t === "trace" && trace.length > 0 && <span className="tBadge">{trace.length}</span>}
-                {t === "execution" && steps.length > 0 && <span className="tBadge">{steps.length}</span>}
-              </button>
-            ))}
-          </div>
-          <div className="dockBody">
-            {activeTab === "trace" && (
-              <ol className="traceList">
-                {trace.map((item, i) => <li key={i} className="traceItem" style={{ animationDelay: `${i * 0.04}s` }}>{item}</li>)}
-                {trace.length === 0 && <p className="dockEmpty">No reasoning trace available.</p>}
-              </ol>
-            )}
-            {activeTab === "execution" && (
-              <div className="execList">
-                {steps.map(s => <StepRow key={s.name} step={s} />)}
-              </div>
-            )}
-            {activeTab === "planner" && (
-              <div className="planView">
-                <div className="planMeta">
-                  <span>Source: <strong>{result.planner?.planner_source ?? "unknown"}</strong></span>
-                  {result.planner?.model && <span>Model: <strong>{result.planner.model}</strong></span>}
+          {/* Left: tabbed debug panel */}
+          <div className="dockLeft">
+            <div className="dockTabs">
+              {([
+                { id: "trace",     label: "Reasoning Trace",  count: trace.length },
+                { id: "execution", label: "Execution Steps",   count: steps.length },
+                { id: "planner",   label: "Planner",           count: 0 },
+                { id: "sql",       label: "SQL Queries",       count: steps.filter(s => s.sql).length },
+                { id: "raw",       label: "Raw Results",       count: 0 },
+              ] as const).map(t => (
+                <button
+                  key={t.id}
+                  className={`dTab ${activeTab === t.id ? "active" : ""}`}
+                  onClick={() => setActiveTab(t.id)}
+                >
+                  {t.label}
+                  {t.count > 0 && <span className="tBadge">{t.count}</span>}
+                </button>
+              ))}
+            </div>
+            <div className="dockBody">
+              {activeTab === "trace" && (
+                <ol className="traceList">
+                  {trace.map((item, i) => (
+                    <li key={i} className="traceItem" style={{ animationDelay: `${i * 0.04}s` }}>{item}</li>
+                  ))}
+                  {trace.length === 0 && <p className="dockEmpty">No reasoning trace available.</p>}
+                </ol>
+              )}
+              {activeTab === "execution" && (
+                <div className="execList">
+                  {steps.map(s => <StepRow key={s.name} step={s} />)}
                 </div>
-                {result.planner?.fallback_reason && <p className="planWarn">{result.planner.fallback_reason}</p>}
-                <div className="planSection">
-                  <span className="planLabel">Selected Tools</span>
-                  <div className="chipRow">
-                    {(result.planner?.selected_tools ?? []).map(t => <span key={t} className="chip">{t}</span>)}
-                    {(result.planner?.selected_tools ?? []).length === 0 && <span className="dockEmpty">None</span>}
+              )}
+              {activeTab === "planner" && (
+                <div className="planView">
+                  <div className="planMeta">
+                    <span>Source: <strong>{result.planner?.planner_source ?? "unknown"}</strong></span>
+                    {result.planner?.model && <span>Model: <strong>{result.planner.model}</strong></span>}
                   </div>
-                </div>
-                {(result.planner?.skipped_tools ?? []).length > 0 && (
+                  {result.planner?.fallback_reason && <p className="planWarn">{result.planner.fallback_reason}</p>}
                   <div className="planSection">
-                    <span className="planLabel">Skipped</span>
-                    {result.planner!.skipped_tools!.map(s => (
-                      <div key={s.tool} className="skipRow"><strong>{s.tool}</strong><span>{s.reason}</span></div>
-                    ))}
+                    <span className="planLabel">Selected Tools</span>
+                    <div className="chipRow">
+                      {(result.planner?.selected_tools ?? []).map(t => <span key={t} className="chip">{t}</span>)}
+                      {(result.planner?.selected_tools ?? []).length === 0 && <span className="dockEmpty">None</span>}
+                    </div>
                   </div>
-                )}
-              </div>
-            )}
+                  {(result.planner?.skipped_tools ?? []).length > 0 && (
+                    <div className="planSection">
+                      <span className="planLabel">Skipped</span>
+                      {result.planner!.skipped_tools!.map(s => (
+                        <div key={s.tool} className="skipRow"><strong>{s.tool}</strong><span>{s.reason}</span></div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {activeTab === "sql" && (
+                <div className="execList">
+                  {steps.filter(s => s.sql).map(s => (
+                    <div key={s.name} style={{ marginBottom: 10 }}>
+                      <span className="execDetailLabel">{s.name}</span>
+                      <pre className="execPre">{s.sql}</pre>
+                    </div>
+                  ))}
+                  {steps.filter(s => s.sql).length === 0 && <p className="dockEmpty">No SQL queries recorded.</p>}
+                </div>
+              )}
+              {activeTab === "raw" && (
+                <pre className="execPre" style={{ fontSize: "0.68rem" }}>
+                  {JSON.stringify(result, null, 2).slice(0, 4000)}
+                </pre>
+              )}
+            </div>
+          </div>
+
+          {/* Right: Source Status */}
+          <div className="dockRight">
+            <div className="dockRightTitle">
+              Source Status
+              <span className="badge">{Object.keys(sources).length}</span>
+            </div>
+            <div className="srcStatusList">
+              {Object.entries(sources).map(([name, s]) => {
+                let logoPath = "https://api.iconify.design/lucide:file-text.svg?color=%2394a3b8";
+                if (name.includes("github")) logoPath = "/logos/github.png";
+                else if (name.includes("slack")) logoPath = "/logos/slack.png";
+                else if (name.includes("notion")) logoPath = "/logos/notion.png";
+                else if (name.includes("osv")) logoPath = "/logos/osv.png";
+                else if (name.includes("deps")) logoPath = "https://api.iconify.design/logos:npm-icon.svg";
+
+                const isOn = s.available;
+                const toolCount = (s.tools ?? []).length;
+                return (
+                  <div key={name} className="srcStatusRow">
+                    <div className="srcStatusIcon" style={{ background: 'transparent', padding: 0 }}>
+                      <img src={logoPath} alt={name} style={{ width: 20, height: 20, objectFit: 'contain', borderRadius: name.includes("osv") ? '50%' : 4 }} />
+                    </div>
+                    <div className="srcStatusBody">
+                      <span className="srcStatusName">{name.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}</span>
+                      {toolCount > 0 && <span className="srcStatusMeta">{toolCount} tool{toolCount !== 1 ? "s" : ""} available</span>}
+                    </div>
+                    <span className={`srcStatusBadge ${isOn ? "ok" : "off"}`}>
+                      {isOn ? "Connected" : "Offline"}
+                    </span>
+                  </div>
+                );
+              })}
+              {Object.keys(sources).length === 0 && (
+                <p className="dockEmpty">No source data.</p>
+              )}
+            </div>
           </div>
         </section>
+
+        <SchemaPanel isOpen={isSchemaOpen} onClose={() => setIsSchemaOpen(false)} />
       </motion.div>
     );
   }
@@ -327,7 +396,7 @@ export default function Home() {
           ))}
         </div>
 
-        <form onSubmit={(e: FormEvent) => { e.preventDefault(); void runInvestigation(); }}>
+        <form className="qForm" onSubmit={(e: FormEvent) => { e.preventDefault(); void runInvestigation(); }}>
           <div className="qArea">
             <textarea className="qInput" value={form.question}
               onChange={e => setForm({ ...form, question: e.target.value })}
@@ -342,13 +411,7 @@ export default function Home() {
             <div className="cfgGrid">
               <TF label="Owner" value={form.owner} set={v => setForm({ ...form, owner: v })} />
               <TF label="Repository" value={form.repo} set={v => setForm({ ...form, repo: v })} />
-              <TF label="Org" value={form.org} set={v => setForm({ ...form, org: v })} />
               <TF label="Slack channel" value={form.slack_channel} set={v => setForm({ ...form, slack_channel: v })} ph="optional" />
-              <TF label="Policy query" value={form.policy_query} set={v => setForm({ ...form, policy_query: v })} />
-              <TF label="Package system" value={form.package_system} set={v => setForm({ ...form, package_system: v })} />
-              <TF label="Ecosystem" value={form.package_ecosystem} set={v => setForm({ ...form, package_ecosystem: v })} />
-              <TF label="Package" value={form.package_name} set={v => setForm({ ...form, package_name: v })} />
-              <TF label="Version" value={form.package_version} set={v => setForm({ ...form, package_version: v })} />
             </div>
           </details>
         </form>

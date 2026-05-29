@@ -1,13 +1,33 @@
+import ast
 import json
+import logging
 import os
+import time
+import uuid
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from coral_mcp_client import CoralMCPClient, CoralMCPError, mcp_discovery_enabled
-from coral_client import CoralClient, CoralClientError
+from coral_client import CoralClient, CoralClientError, load_dotenv
 from llm_orchestrator import LLMPlannerError, plan_with_openrouter
+
+load_dotenv()
+
+
+def configure_logging() -> None:
+    level = os.getenv("HARBORGUARD_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger("harborguard").setLevel(level)
+
+
+configure_logging()
+logger = logging.getLogger("harborguard.api")
 
 app = FastAPI(
     title="HarborGuard",
@@ -26,6 +46,69 @@ app.add_middleware(
 )
 
 coral = CoralClient()
+
+
+def env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def fixtures_enabled() -> bool:
+    return env_truthy("HARBORGUARD_USE_FIXTURES")
+
+
+def load_fixture(name: str) -> dict[str, object] | None:
+    if not fixtures_enabled():
+        return None
+
+    fixture_dir = os.getenv("HARBORGUARD_FIXTURES_DIR")
+    if fixture_dir:
+        path = Path(fixture_dir) / f"{name}.json"
+    else:
+        path = Path(__file__).resolve().parent / "fixtures" / f"{name}.json"
+
+    if not path.exists():
+        logger.warning("fixture.missing name=%s path=%s", name, path)
+        return None
+
+    try:
+        return json.loads(path.read_text())
+    except Exception as error:
+        logger.warning("fixture.load_failed name=%s error=%s", name, error)
+        return None
+
+
+@app.middleware("http")
+async def log_http_requests(request: Request, call_next):
+    request_id = uuid.uuid4().hex[:8]
+    started_at = time.perf_counter()
+    logger.info(
+        "http.request.start request_id=%s method=%s path=%s",
+        request_id,
+        request.method,
+        request.url.path,
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "http.request.error request_id=%s method=%s path=%s duration_ms=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            elapsed_ms(started_at),
+        )
+        raise
+
+    response.headers["X-HarborGuard-Request-Id"] = request_id
+    logger.info(
+        "http.request.done request_id=%s method=%s path=%s status=%s duration_ms=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms(started_at),
+    )
+    return response
 
 
 class PackageInvestigationReq(BaseModel):
@@ -80,6 +163,20 @@ INVESTIGATION_TOOLS = {
         "capabilities": ["package_metadata", "dependency_risk"],
         "step": "deps_dev_package_version",
     },
+    "deps_dev.dependencies": {
+        "source": "deps_dev",
+        "kind": "table",
+        "purpose": "Inspect package dependency graph context.",
+        "capabilities": ["dependency_context"],
+        "step": "deps_dev_dependencies",
+    },
+    "deps_dev.advisories": {
+        "source": "deps_dev",
+        "kind": "table",
+        "purpose": "Inspect advisory details and CVSS scores.",
+        "capabilities": ["advisory_context"],
+        "step": "deps_dev_advisories",
+    },
     "osv.query_by_version": {
         "source": "osv",
         "kind": "table",
@@ -108,6 +205,21 @@ def sql_string(value: str) -> str:
     return value.replace("'", "''")
 
 
+def deps_dev_advisories_sql(advisory_keys: list[str]) -> str | None:
+    if not advisory_keys:
+        return None
+    normalized = [sql_string(key) for key in advisory_keys if key]
+    if not normalized:
+        return None
+    key_list = ", ".join(f"'{key}'" for key in normalized[:5])
+    return f"""
+    SELECT advisory_id, title, advisory_url, cvss3_score, aliases
+    FROM deps_dev.advisories
+    WHERE advisory_id IN ({key_list})
+    LIMIT 20
+    """
+
+
 def query_step(name: str, sql: str) -> dict[str, object]:
     return query_step_with_timeout(name, sql, None)
 
@@ -117,23 +229,46 @@ def query_step_with_timeout(
     sql: str,
     timeout_seconds: float | None,
 ) -> dict[str, object]:
+    started_at = time.perf_counter()
+    logger.info(
+        "agent.step.start name=%s timeout=%s sql=%s",
+        name,
+        f"{timeout_seconds:g}s" if timeout_seconds else "default",
+        compact_sql(sql),
+    )
     try:
         result = coral.query(sql, timeout_seconds=timeout_seconds)
     except CoralClientError as error:
+        duration_ms = elapsed_ms(started_at)
+        logger.warning(
+            "agent.step.failed name=%s duration_ms=%s error=%s",
+            name,
+            duration_ms,
+            compact_text(str(error)),
+        )
         return {
             "name": name,
             "ok": False,
             "rows": [],
             "sql": sql,
             "error": str(error),
+            "duration_ms": duration_ms,
         }
 
+    duration_ms = elapsed_ms(started_at)
+    logger.info(
+        "agent.step.ok name=%s duration_ms=%s rows=%s",
+        name,
+        duration_ms,
+        len(result.rows),
+    )
     return {
         "name": name,
         "ok": True,
         "rows": result.rows,
         "sql": result.sql,
         "error": None,
+        "duration_ms": duration_ms,
     }
 
 
@@ -158,6 +293,204 @@ def level_from_score(score: int) -> str:
     return "low"
 
 
+def package_level_from_score(score: int) -> str:
+    if score >= 80:
+        return "critical"
+    if score >= 60:
+        return "high"
+    if score >= 30:
+        return "medium"
+    return "low"
+
+
+def recommendation_from_score(score: int) -> str:
+    level = package_level_from_score(score)
+    if level == "critical":
+        return "Block release until the issue is resolved."
+    if level == "high":
+        return "Require security review before release."
+    if level == "medium":
+        return "Require maintainer acknowledgement."
+    return "Allow with normal review."
+
+
+def normalize_advisory_keys(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                parsed = None
+
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if item]
+        if isinstance(parsed, str):
+            return [parsed]
+        if "," in text:
+            return [chunk.strip() for chunk in text.split(",") if chunk.strip()]
+        return [text]
+    return []
+
+
+def advisory_keys_from_version(version_row: dict | None) -> list[str]:
+    if not version_row:
+        return []
+    return normalize_advisory_keys(version_row.get("advisory_keys"))
+
+
+def advisory_rows_have_cvss(advisory_rows: list[dict]) -> bool:
+    for row in advisory_rows:
+        score = row.get("cvss3_score") or row.get("cvss_score")
+        try:
+            if float(score) >= 5:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def version_deprecated(version_row: dict | None) -> bool:
+    if not version_row:
+        return False
+    for key in ("is_deprecated", "deprecated"):
+        value = version_row.get(key)
+        if isinstance(value, bool) and value:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def package_risk_assessment(
+    osv_rows: list[dict],
+    deps_version: dict | None,
+    advisory_rows: list[dict],
+    dependency_rows: list[dict],
+    advisory_keys: list[str],
+) -> dict[str, object]:
+    score = 0
+    reasons: list[str] = []
+
+    if osv_rows:
+        score += 50
+        reasons.append("osv_vulnerability")
+
+    if advisory_rows_have_cvss(advisory_rows):
+        score += 20
+        reasons.append("deps_dev_advisory_cvss")
+
+    if advisory_keys and not osv_rows:
+        score += 10
+        reasons.append("deps_dev_advisory_keys")
+
+    if version_deprecated(deps_version):
+        score += 10
+        reasons.append("version_deprecated")
+
+    if dependency_rows:
+        score += 5
+        reasons.append("dependency_context")
+
+    summary_parts: list[str] = []
+    if osv_rows:
+        summary_parts.append("OSV reports vulnerabilities for this package version.")
+    if advisory_rows:
+        summary_parts.append("deps.dev advisory details are available.")
+    elif advisory_keys:
+        summary_parts.append("deps.dev advisory keys are present.")
+    if dependency_rows:
+        summary_parts.append("Dependency graph includes direct dependencies.")
+    if version_deprecated(deps_version):
+        summary_parts.append("Package version is marked deprecated.")
+
+    summary = (
+        " ".join(summary_parts)
+        if summary_parts
+        else "No vulnerability evidence found for this package version."
+    )
+
+    return {
+        "score": score,
+        "severity": package_level_from_score(score),
+        "summary": summary,
+        "recommendation": recommendation_from_score(score),
+        "reasons": reasons,
+    }
+
+
+def build_package_evidence(
+    osv_rows: list[dict],
+    deps_version: dict | None,
+    advisory_rows: list[dict],
+    dependency_rows: list[dict],
+    advisory_keys: list[str],
+) -> list[dict[str, object]]:
+    evidence: list[dict[str, object]] = []
+
+    for vuln in osv_rows[:5]:
+        osv_id = vuln.get("id")
+        evidence.append(
+            {
+                "source": "osv.query_by_version",
+                "text": vuln.get("summary") or osv_id or "OSV vulnerability match",
+                "url": f"https://osv.dev/vulnerability/{osv_id}" if osv_id else None,
+            }
+        )
+
+    if advisory_keys:
+        evidence.append(
+            {
+                "source": "deps_dev.versions",
+                "text": f"deps.dev advisory keys: {advisory_keys}",
+                "url": None,
+            }
+        )
+
+    for advisory in advisory_rows[:5]:
+        title = advisory.get("title") or advisory.get("advisory_id") or "deps.dev advisory"
+        cvss = advisory.get("cvss3_score") or advisory.get("cvss_score")
+        if cvss is not None:
+            title = f"{title} (CVSS {cvss})"
+        evidence.append(
+            {
+                "source": "deps_dev.advisories",
+                "text": title,
+                "url": advisory.get("advisory_url") or advisory.get("url"),
+            }
+        )
+
+    for dep in dependency_rows[:5]:
+        name = dep.get("dependency_name") or dep.get("dependency")
+        version = dep.get("dependency_version")
+        relation = dep.get("relation")
+        if name and version:
+            text = f"{name}@{version}"
+        elif name:
+            text = str(name)
+        elif version:
+            text = str(version)
+        else:
+            text = "dependency"
+        if relation:
+            text = f"{text} ({relation})"
+        evidence.append(
+            {
+                "source": "deps_dev.dependencies",
+                "text": text,
+                "url": None,
+            }
+        )
+
+    return evidence
+
+
 def first_rows(step: dict[str, object], limit: int = 3) -> list[dict]:
     rows = step.get("rows")
     if not isinstance(rows, list):
@@ -165,7 +498,18 @@ def first_rows(step: dict[str, object], limit: int = 3) -> list[dict]:
     return rows[:limit]
 
 
+def step_by_name(
+    steps: list[dict[str, object]],
+    name: str,
+) -> dict[str, object] | None:
+    for step in steps:
+        if step.get("name") == name:
+            return step
+    return None
+
+
 def skipped_step(name: str, reason: str) -> dict[str, object]:
+    logger.info("agent.step.skipped name=%s reason=%s", name, reason)
     return {
         "name": name,
         "ok": True,
@@ -174,7 +518,22 @@ def skipped_step(name: str, reason: str) -> dict[str, object]:
         "sql": None,
         "error": None,
         "reason": reason,
+        "duration_ms": 0,
     }
+
+
+def elapsed_ms(started_at: float) -> int:
+    return round((time.perf_counter() - started_at) * 1000)
+
+
+def compact_sql(sql: str, limit: int = 320) -> str:
+    return compact_text(" ".join(sql.split()), limit)
+
+
+def compact_text(text: str, limit: int = 320) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
 
 
 def query_capability_metadata() -> list[dict[str, object]]:
@@ -374,16 +733,23 @@ def json_dumps(value: object) -> str:
 
 
 def discover_capabilities() -> dict[str, object]:
+    started_at = time.perf_counter()
+    backend = "coral_mcp_with_sql_fallback" if mcp_discovery_enabled() else "coral_sql_metadata"
+    logger.info("capabilities.discovery.start backend=%s", backend)
     metadata_steps = (
         query_capability_metadata_from_mcp()
         if mcp_discovery_enabled()
         else query_capability_metadata()
     )
     capabilities = build_capabilities(metadata_steps)
-    capabilities["discovery_backend"] = (
-        "coral_mcp_with_sql_fallback"
-        if mcp_discovery_enabled()
-        else "coral_sql_metadata"
+    capabilities["discovery_backend"] = backend
+    capabilities["duration_ms"] = elapsed_ms(started_at)
+    logger.info(
+        "capabilities.discovery.done backend=%s duration_ms=%s available_tools=%s metadata_ok=%s",
+        backend,
+        capabilities["duration_ms"],
+        capabilities["summary"]["available_tool_count"],
+        capabilities["summary"]["metadata_ok"],
     )
     return capabilities
 
@@ -448,16 +814,26 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
     sources = {}
     for source in REQUIRED_SOURCES:
         source_inputs = [row for row in inputs if row.get("schema_name") == source]
+        required_inputs = [
+            row
+            for row in source_inputs
+            if row.get("required")
+        ]
+        missing_inputs = [
+            str(row.get("key"))
+            for row in required_inputs
+            if not row.get("is_set")
+        ]
         sources[source] = {
             "available": source in source_names,
             "inputs": source_inputs,
             "configured": all(
                 bool(row.get("is_set"))
-                for row in source_inputs
-                if row.get("required")
+                for row in required_inputs
             )
             if source_inputs
             else source in source_names,
+            "missing_inputs": missing_inputs,
             "tools": [
                 tool_name
                 for tool_name, tool in tools.items()
@@ -477,6 +853,12 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
                 1 for tool in tools.values() if tool["available"]
             ),
             "metadata_ok": required_metadata_ok,
+            "unavailable_sources": [
+                source for source, status in sources.items() if not status["available"]
+            ],
+            "unconfigured_sources": [
+                source for source, status in sources.items() if not status["configured"]
+            ],
         },
         "metadata_steps": metadata_steps,
     }
@@ -540,6 +922,8 @@ def plan_investigation(
     if wants_dependency:
         consider("github.alerts", "question needs GitHub dependency alert context")
         consider("deps_dev.versions", "question needs package metadata")
+        consider("deps_dev.dependencies", "question needs dependency context")
+        consider("deps_dev.advisories", "question needs advisory detail")
         consider("osv.query_by_version", "question needs vulnerability lookup")
 
     if wants_secret:
@@ -627,17 +1011,38 @@ def plan_with_orchestrator(
     capabilities: dict[str, object],
 ) -> dict[str, object]:
     allowed_tools = list(INVESTIGATION_TOOLS)
+    started_at = time.perf_counter()
+    logger.info(
+        "planner.start question=%s allowed_tools=%s",
+        compact_text(req.question),
+        len(allowed_tools),
+    )
     try:
         llm_plan = plan_with_openrouter(req, capabilities, allowed_tools)
-        return validate_plan(llm_plan, req, capabilities)
+        plan = validate_plan(llm_plan, req, capabilities)
+        plan["duration_ms"] = elapsed_ms(started_at)
+        logger.info(
+            "planner.done source=%s duration_ms=%s selected_tools=%s",
+            plan.get("planner_source"),
+            plan["duration_ms"],
+            len(plan.get("selected_tools", [])),
+        )
+        return plan
     except LLMPlannerError as error:
         fallback = plan_investigation(req, capabilities)
         fallback["planner_source"] = "deterministic_fallback"
         fallback["fallback_reason"] = str(error)
+        fallback["duration_ms"] = elapsed_ms(started_at)
         fallback["reasoning_trace"] = [
             f"LLM planner unavailable, falling back to deterministic planner: {error}.",
             *fallback["reasoning_trace"],
         ]
+        logger.warning(
+            "planner.fallback duration_ms=%s reason=%s selected_tools=%s",
+            fallback["duration_ms"],
+            compact_text(str(error)),
+            len(fallback.get("selected_tools", [])),
+        )
         return fallback
 
 
@@ -670,39 +1075,37 @@ def build_agent_findings(
             }
         )
 
-    osv_vulns = first_rows(by_name["osv_package_vulnerabilities"], limit=10)
-    deps_versions = first_rows(by_name["deps_dev_package_version"], limit=1)
+    osv_vulns = first_rows(by_name.get("osv_package_vulnerabilities", {}), limit=10)
+    deps_versions = first_rows(by_name.get("deps_dev_package_version", {}), limit=1)
     deps_version = deps_versions[0] if deps_versions else None
-    advisory_keys = deps_version.get("advisory_keys") if deps_version else None
+    deps_dependencies = first_rows(by_name.get("deps_dev_dependencies", {}), limit=10)
+    deps_advisories = first_rows(by_name.get("deps_dev_advisories", {}), limit=10)
+    advisory_keys = advisory_keys_from_version(deps_version)
 
-    if osv_vulns or advisory_keys:
-        evidence = [
-            {
-                "source": "osv.query_by_version",
-                "text": vuln.get("summary") or vuln.get("id") or "OSV vulnerability match",
-                "url": f"https://osv.dev/vulnerability/{vuln.get('id')}"
-                if vuln.get("id")
-                else None,
-            }
-            for vuln in osv_vulns[:5]
-        ]
-        if advisory_keys:
-            evidence.append(
-                {
-                    "source": "deps_dev.versions",
-                    "text": f"deps.dev advisory keys: {advisory_keys}",
-                    "url": None,
-                }
-            )
+    package_risk = package_risk_assessment(
+        osv_vulns,
+        deps_version,
+        deps_advisories,
+        deps_dependencies,
+        advisory_keys,
+    )
+    evidence = build_package_evidence(
+        osv_vulns,
+        deps_version,
+        deps_advisories,
+        deps_dependencies,
+        advisory_keys,
+    )
 
+    if evidence:
         findings.append(
             {
                 "type": "vulnerable_dependency",
                 "title": f"{req.package_name}@{req.package_version} has vulnerability evidence",
-                "severity": "high",
-                "score": 80,
+                "severity": package_risk["severity"],
+                "score": package_risk["score"],
                 "evidence": evidence,
-                "recommendation": "Require security review before release.",
+                "recommendation": package_risk["recommendation"],
             }
         )
 
@@ -741,28 +1144,36 @@ def build_agent_findings(
         ".env",
     )
     pull_rows = first_rows(by_name["github_recent_pulls"], limit=20)
+
+    def _risky_keyword_count(row: dict) -> int:
+        text = f"{row.get('title', '')} {row.get('body', '')} {row.get('label_names', '')}".lower()
+        return sum(1 for word in risky_keywords if word in text)
+
     risky_pulls = [
-        row
+        (row, _risky_keyword_count(row))
         for row in pull_rows
-        if any(
-            word in f"{row.get('title', '')} {row.get('body', '')} {row.get('label_names', '')}".lower()
-            for word in risky_keywords
-        )
+        if _risky_keyword_count(row) > 0
     ]
+    # Sort by keyword count descending so the riskiest PRs surface first
+    risky_pulls.sort(key=lambda item: item[1], reverse=True)
+
     if risky_pulls:
+        # Score scales: 25 base + 5 per keyword hit across all risky PRs, capped at 65
+        total_hits = sum(count for _, count in risky_pulls)
+        pr_score = min(25 + total_hits * 5, 65)
         findings.append(
             {
                 "type": "risky_change",
-                "title": "Recent merged pull requests mention sensitive areas",
-                "severity": "medium",
-                "score": 45,
+                "title": f"{len(risky_pulls)} recent merged pull request(s) mention sensitive areas",
+                "severity": level_from_score(pr_score),
+                "score": pr_score,
                 "evidence": [
                     {
                         "source": "github.pulls",
                         "text": f"PR #{row.get('number')}: {row.get('title')}",
-                        "url": row.get("url"),
+                        "url": row.get("html_url") or row.get("url"),
                     }
-                    for row in risky_pulls[:5]
+                    for row, _ in risky_pulls[:5]
                 ],
                 "recommendation": "Ask the security reviewer to inspect these changes.",
             }
@@ -829,14 +1240,46 @@ def build_evidence_graph(
                 "url": evidence.get("url"),
             }
             
+            # --- Extract canonical vuln ID from URL or label ---
+            import re
+            ghsa_match = re.search(r'(GHSA-[\w-]+)', label) or (
+                re.search(r'(GHSA-[\w-]+)', str(evidence.get("url") or ""))
+            )
+            cve_match = re.search(r'(CVE-\d{4}-\d+)', label)
+            canonical_vuln_id = None
+            if ghsa_match:
+                canonical_vuln_id = f"vuln:{ghsa_match.group(1)}"
+            elif cve_match:
+                canonical_vuln_id = f"vuln:{cve_match.group(1)}"
+            
             if source == "osv.query_by_version" and evidence.get("url"):
-                evidence_id = f"vuln:{str(evidence['url']).rsplit('/', 1)[-1]}"
+                evidence_id = canonical_vuln_id or f"vuln:{str(evidence['url']).rsplit('/', 1)[-1]}"
                 node["id"] = evidence_id
                 node["type"] = "vulnerability"
-                # Pass severity and score to vuln if available in finding
                 if finding.get("severity"): node["severity"] = finding.get("severity")
                 if finding.get("score"): node["score"] = finding.get("score")
                 vuln_nodes.append(evidence_id)
+            elif source == "deps_dev.advisories":
+                # Merge into existing vuln node if same advisory
+                evidence_id = canonical_vuln_id or evidence_id
+                if evidence_id in nodes:
+                    # Enrich existing node with deps.dev info (e.g. CVSS score from label)
+                    cvss_match = re.search(r'CVSS\s+([\d.]+)', label)
+                    if cvss_match and not nodes[evidence_id].get("score"):
+                        nodes[evidence_id]["score"] = float(cvss_match.group(1))
+                    if evidence.get("url") and not nodes[evidence_id].get("url"):
+                        nodes[evidence_id]["url"] = evidence.get("url")
+                    # Don't create a duplicate node or edge
+                    continue
+                node["id"] = evidence_id
+                node["type"] = "vulnerability"
+                if finding.get("severity"): node["severity"] = finding.get("severity")
+                if finding.get("score"): node["score"] = finding.get("score")
+                vuln_nodes.append(evidence_id)
+            elif source == "deps_dev.versions":
+                # This is metadata about the package itself, not a separate evidence node.
+                # Skip creating a standalone node — the info is already in the package node.
+                continue
             elif source == "github.pulls":
                 node["type"] = "pull_request"
                 source_nodes.append(evidence_id)
@@ -903,12 +1346,117 @@ def build_evidence_graph(
             # Discussion connects to Package
             edges.append({"from": package_id, "to": discussion_id, "type": "discussed_in"})
 
-    return {"nodes": list(nodes.values()), "edges": edges}
+    # Deduplicate edges
+    seen_edges = set()
+    unique_edges = []
+    for edge in edges:
+        key = (edge["from"], edge["to"], edge["type"])
+        if key not in seen_edges:
+            seen_edges.add(key)
+            unique_edges.append(edge)
+
+    return {"nodes": list(nodes.values()), "edges": unique_edges}
+
+
+def build_debug_timeline(
+    metadata_steps: object,
+    plan: dict[str, object],
+    steps: list[dict[str, object]],
+    total_duration_ms: int,
+) -> list[dict[str, object]]:
+    timeline: list[dict[str, object]] = [
+        {
+            "phase": "metadata",
+            "name": "discover_capabilities",
+            "ok": all(
+                bool(step.get("ok"))
+                for step in metadata_steps
+                if isinstance(step, dict)
+            )
+            if isinstance(metadata_steps, list)
+            else False,
+            "duration_ms": sum_step_durations(metadata_steps),
+        },
+        {
+            "phase": "planning",
+            "name": str(plan.get("planner_source") or "planner"),
+            "ok": not bool(plan.get("fallback_reason")),
+            "duration_ms": int(plan.get("duration_ms") or 0),
+            "selected_tools": plan.get("selected_tools", []),
+            "fallback_reason": plan.get("fallback_reason"),
+        },
+    ]
+
+    for step in steps:
+        timeline.append(
+            {
+                "phase": "execution",
+                "name": step.get("name"),
+                "ok": step.get("ok"),
+                "skipped": step.get("skipped", False),
+                "duration_ms": int(step.get("duration_ms") or 0),
+                "rows": len(step.get("rows", []))
+                if isinstance(step.get("rows"), list)
+                else 0,
+                "error": step.get("error"),
+                "reason": step.get("reason"),
+            }
+        )
+
+    timeline.append(
+        {
+            "phase": "synthesis",
+            "name": "risk_assessment",
+            "ok": True,
+            "duration_ms": total_duration_ms,
+        }
+    )
+    return timeline
+
+
+def sum_step_durations(steps: object) -> int:
+    if not isinstance(steps, list):
+        return 0
+    return sum(
+        int(step.get("duration_ms") or 0)
+        for step in steps
+        if isinstance(step, dict)
+    )
 
 
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {"name": "HarborGuard", "status": "READY"}
+
+
+@app.post("/agent/plan")
+def agent_plan(req: AgentInvestigationReq) -> dict[str, object]:
+    """Dry-run planner endpoint: discovers capabilities and returns the investigation
+    plan without executing any Coral queries.  Useful for debugging and the frontend
+    Coral capability panel."""
+    started_at = time.perf_counter()
+    logger.info(
+        "endpoint.agent_plan.start owner=%s repo=%s question=%s",
+        req.owner,
+        req.repo,
+        compact_text(req.question),
+    )
+    capabilities = discover_capabilities()
+    plan = plan_with_orchestrator(req, capabilities)
+    duration_ms = elapsed_ms(started_at)
+    logger.info(
+        "endpoint.agent_plan.done duration_ms=%s selected_tools=%s planner=%s",
+        duration_ms,
+        len(plan.get("selected_tools", [])),
+        plan.get("planner_source"),
+    )
+    return {
+        "question": req.question,
+        "plan": plan,
+        "capability_summary": capabilities["summary"],
+        "capabilities": capabilities,
+        "duration_ms": duration_ms,
+    }
 
 
 @app.get("/health")
@@ -941,7 +1489,13 @@ def sources() -> dict[str, object]:
 
 @app.get("/agent/capabilities")
 def agent_capabilities() -> dict[str, object]:
+    logger.info("endpoint.agent_capabilities.start")
     capabilities = discover_capabilities()
+    logger.info(
+        "endpoint.agent_capabilities.done available_sources=%s available_tools=%s",
+        capabilities["summary"]["available_source_count"],
+        capabilities["summary"]["available_tool_count"],
+    )
 
     return {
         "description": "Coral metadata-derived HarborGuard investigation capabilities.",
@@ -977,6 +1531,20 @@ def agent_coral_debug() -> dict[str, object]:
 
 @app.post("/investigate/package")
 def package_investigation(req: PackageInvestigationReq) -> dict[str, object]:
+    started_at = time.perf_counter()
+    logger.info(
+        "endpoint.package_investigation.start system=%s ecosystem=%s package=%s version=%s",
+        req.system,
+        req.ecosystem,
+        req.package_name,
+        req.version,
+    )
+    fixture = load_fixture("package_investigate")
+    if fixture:
+        response = dict(fixture)
+        response["subject"] = req.model_dump()
+        response["fixture_used"] = True
+        return response
     package_name = sql_string(req.package_name)
     version = sql_string(req.version)
     system = sql_string(req.system)
@@ -998,9 +1566,48 @@ def package_investigation(req: PackageInvestigationReq) -> dict[str, object]:
       AND version = '{version}'
     LIMIT 20
     """
+    deps_dependencies_sql = f"""
+    SELECT dependency_name, dependency_version, relation
+    FROM deps_dev.dependencies
+    WHERE system = '{system}'
+      AND package_name = '{package_name}'
+      AND version = '{version}'
+    LIMIT 20
+    """
 
     deps_step = query_step("deps_dev_package_version", deps_sql)
+    deps_dependencies_step = query_step("deps_dev_dependencies", deps_dependencies_sql)
     osv_step = query_step("osv_package_vulnerabilities", osv_sql)
+    deps_version_rows = first_rows(deps_step, limit=1)
+    deps_version = deps_version_rows[0] if deps_version_rows else None
+    advisory_keys = advisory_keys_from_version(deps_version)
+    advisories_sql = deps_dev_advisories_sql(advisory_keys)
+    if advisories_sql:
+        deps_advisories_step = query_step("deps_dev_advisories", advisories_sql)
+    else:
+        deps_advisories_step = skipped_step(
+            "deps_dev_advisories",
+            "deps.dev version metadata did not include advisory keys",
+        )
+
+    osv_rows = first_rows(osv_step, limit=20)
+    deps_dependencies_rows = first_rows(deps_dependencies_step, limit=20)
+    deps_advisory_rows = first_rows(deps_advisories_step, limit=20)
+    package_risk = package_risk_assessment(
+        osv_rows,
+        deps_version,
+        deps_advisory_rows,
+        deps_dependencies_rows,
+        advisory_keys,
+    )
+    evidence = build_package_evidence(
+        osv_rows,
+        deps_version,
+        deps_advisory_rows,
+        deps_dependencies_rows,
+        advisory_keys,
+    )
+
     findings = build_agent_findings(
         AgentInvestigationReq(
             question=f"Is {req.package_name}@{req.version} risky?",
@@ -1015,6 +1622,8 @@ def package_investigation(req: PackageInvestigationReq) -> dict[str, object]:
             {"name": "github_dependabot_alerts", "rows": []},
             osv_step,
             deps_step,
+            deps_dependencies_step,
+            deps_advisories_step,
             {"name": "github_secret_file_search", "rows": []},
             {"name": "github_recent_pulls", "rows": []},
             {"name": "notion_policy_context", "rows": []},
@@ -1022,16 +1631,50 @@ def package_investigation(req: PackageInvestigationReq) -> dict[str, object]:
         ],
     )
 
+    duration_ms = elapsed_ms(started_at)
+    logger.info(
+        "endpoint.package_investigation.done duration_ms=%s findings=%s",
+        duration_ms,
+        len(findings),
+    )
+    steps = [deps_step, deps_dependencies_step, deps_advisories_step, osv_step]
     return {
         "subject": req.model_dump(),
-        "risk_level": findings[0]["severity"] if findings else "low",
+        "risk_level": package_risk["severity"],
+        "severity": package_risk["severity"],
+        "score": package_risk["score"],
+        "summary": package_risk["summary"],
+        "recommendation": package_risk["recommendation"],
+        "evidence": evidence,
+        "sql": {
+            "osv": osv_sql,
+            "deps_dev_version": deps_sql,
+            "deps_dev_dependencies": deps_dependencies_sql,
+            "deps_dev_advisories": advisories_sql,
+        },
         "findings": findings,
-        "steps": [deps_step, osv_step],
+        "steps": steps,
+        "debug_timeline": build_debug_timeline([], {}, steps, duration_ms),
     }
 
 
 @app.post("/agent/investigate")
 def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
+    started_at = time.perf_counter()
+    logger.info(
+        "endpoint.agent_investigate.start owner=%s repo=%s package=%s version=%s question=%s",
+        req.owner,
+        req.repo,
+        req.package_name,
+        req.package_version,
+        compact_text(req.question),
+    )
+    fixture = load_fixture("agent_investigate")
+    if fixture:
+        response = dict(fixture)
+        response["question"] = req.question
+        response["fixture_used"] = True
+        return response
     owner = sql_string(req.owner)
     repo = sql_string(req.repo)
     org = sql_string(req.org or req.owner)
@@ -1072,6 +1715,14 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
       AND version = '{package_version}'
     LIMIT 1
     """
+    deps_dev_dependencies_sql = f"""
+    SELECT dependency_name, dependency_version, relation
+    FROM deps_dev.dependencies
+    WHERE system = '{package_system}'
+      AND package_name = '{package_name}'
+      AND version = '{package_version}'
+    LIMIT 20
+    """
     osv_package_vulnerabilities_sql = f"""
     SELECT id, summary, severity, references
     FROM osv.query_by_version
@@ -1100,6 +1751,10 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
             github_secret_file_search_sql,
         ),
         "deps_dev.versions": ("deps_dev_package_version", deps_dev_package_version_sql),
+        "deps_dev.dependencies": (
+            "deps_dev_dependencies",
+            deps_dev_dependencies_sql,
+        ),
         "osv.query_by_version": (
             "osv_package_vulnerabilities",
             osv_package_vulnerabilities_sql,
@@ -1121,6 +1776,32 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
                 {"reason": "planner did not select this tool"},
             )
             steps.append(skipped_step(step_name, skipped["reason"]))
+
+    deps_version_step = step_by_name(steps, "deps_dev_package_version")
+    deps_version_rows = first_rows(deps_version_step or {}, limit=1)
+    deps_version = deps_version_rows[0] if deps_version_rows else None
+    advisory_keys = advisory_keys_from_version(deps_version)
+    advisories_sql = deps_dev_advisories_sql(advisory_keys)
+    if "deps_dev.advisories" in selected_tools:
+        if advisories_sql:
+            advisories_step = query_step("deps_dev_advisories", advisories_sql)
+        else:
+            advisories_step = skipped_step(
+                "deps_dev_advisories",
+                "deps.dev version metadata did not include advisory keys",
+            )
+    else:
+        skipped = next(
+            (
+                item
+                for item in plan["skipped_tools"]
+                if item["tool"] == "deps_dev.advisories"
+            ),
+            {"reason": "planner did not select this tool"},
+        )
+        advisories_step = skipped_step("deps_dev_advisories", skipped["reason"])
+
+    steps.append(advisories_step)
 
     if req.slack_channel:
         slack_channel = sql_string(req.slack_channel)
@@ -1162,11 +1843,26 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
     max_score = max([int(finding["score"]) for finding in findings], default=0)
     risk_level = level_from_score(max_score)
     failed_steps = [step for step in steps if not step.get("ok")]
+    total_duration_ms = elapsed_ms(started_at)
+    debug_timeline = build_debug_timeline(
+        metadata_steps,
+        plan,
+        steps,
+        total_duration_ms,
+    )
     reasoning_trace = [
         *plan["reasoning_trace"],
         f"Executed {len([step for step in steps if not step.get('skipped')])} selected investigation step(s).",
         f"Generated {len(findings)} finding(s) with maximum score {max_score}.",
     ]
+    logger.info(
+        "endpoint.agent_investigate.done duration_ms=%s risk=%s score=%s findings=%s failed_steps=%s",
+        total_duration_ms,
+        risk_level,
+        max_score,
+        len(findings),
+        len(failed_steps),
+    )
 
     return {
         "question": req.question,
@@ -1184,6 +1880,7 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
         "capability_summary": capabilities["summary"],
         "steps": steps,
         "metadata_steps": metadata_steps,
+        "debug_timeline": debug_timeline,
         "source_status": {
             "ok": len(failed_steps) == 0,
             "failed_steps": [

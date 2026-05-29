@@ -1,164 +1,89 @@
 import React, { useMemo, useState } from 'react';
-import { ReactFlow, Background, Edge, Node as ReactFlowNode, Position, MarkerType, DefaultEdgeOptions, ReactFlowInstance } from '@xyflow/react';
+import {
+  ReactFlow,
+  Background,
+  Edge,
+  Node as ReactFlowNode,
+  Position,
+  MarkerType,
+  DefaultEdgeOptions,
+  ReactFlowInstance,
+} from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import dagre from 'dagre';
-import { SourceNode, PackageNode, VulnerabilityNode, DiscussionNode, PolicyNode, EvidenceNode, FindingNode, NodeData } from './nodes/CustomNodes';
+import {
+  SourceNode,
+  PackageNode,
+  VulnerabilityNode,
+  DiscussionNode,
+  PolicyNode,
+  EvidenceNode,
+  FindingNode,
+  NodeData,
+} from './nodes/CustomNodes';
 import { AnimatedEdge } from './edges/AnimatedEdge';
 import { resolveTopology, LayoutMode } from '../utils/topologyResolver';
 
 const nodeTypes = {
-  source: SourceNode,
-  package: PackageNode,
+  source:        SourceNode,
+  package:       PackageNode,
   vulnerability: VulnerabilityNode,
-  discussion: DiscussionNode,
-  policy: PolicyNode,
-  evidence: EvidenceNode,
-  finding: FindingNode,
+  discussion:    DiscussionNode,
+  policy:        PolicyNode,
+  evidence:      EvidenceNode,
+  finding:       FindingNode,
 };
 
-const edgeTypes = {
-  animated: AnimatedEdge,
-};
+const edgeTypes = { animated: AnimatedEdge };
 
 const defaultEdgeOptions: DefaultEdgeOptions = {
   type: 'animated',
   markerEnd: {
     type: MarkerType.ArrowClosed,
-    color: 'rgba(255, 255, 255, 0.2)',
+    color: 'rgba(167,139,250,0.5)',
+    width: 12,
+    height: 12,
   },
 };
 
-type GraphNode = { id: string; type: string; label: string; severity?: string; score?: number; source?: string; url?: string | null };
+// ─── Legend items shown in the header bar ───────────────────────────────────
+const LEGEND = [
+  { key: 'package',       label: 'Dependency', color: '#fb923c' },
+  { key: 'vulnerability', label: 'Risk Signal', color: '#f87171' },
+  { key: 'source',        label: 'Source',      color: '#a78bfa' },
+  { key: 'policy',        label: 'Policy',      color: '#34d399' },
+  { key: 'discussion',    label: 'Discussion',  color: '#60a5fa' },
+  { key: 'evidence',      label: 'Evidence',    color: '#94a3b8' },
+];
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+type GraphNode = {
+  id: string;
+  type: string;
+  label: string;
+  severity?: string;
+  score?: number;
+  source?: string;
+  url?: string | null;
+};
 type GraphEdge = { from: string; to: string; type: string };
 
-function mapToReactFlowData(nodes: GraphNode[], edges: GraphEdge[], mode: LayoutMode) {
-  // Setup Dagre graph
-  const dagreGraph = new dagre.graphlib.Graph();
-  dagreGraph.setDefaultEdgeLabel(() => ({}));
-  
-  // Apply Layout Mode configurations
-  let rankdir = 'LR';
-  let align = undefined;
-  let ranksep = 200;
-  let nodesep = 80;
-
-  if (mode === 'hub') {
-    // Hub works best top-down and centered
-    rankdir = 'TB';
-    align = 'DL'; // Center alignment approximation in dagre
-    nodesep = 120; // more horizontal space for radial-like feel
-  } else if (mode === 'cluster') {
-    rankdir = 'TB';
-    ranksep = 150;
-  }
-  
-  const layout = rankdir as 'LR' | 'TB';
-  
-  // Set graph layout configuration
-  dagreGraph.setGraph({ rankdir, align, ranksep, nodesep });
-
-  // Add nodes to dagre
-  const rfNodes: ReactFlowNode<NodeData>[] = nodes.map(n => {
-    // Determine dimensions based on type
-    let width = 260;
-    let height = 190;
-    
-    let rfType = 'evidence';
-    let icon = '📄';
-    let isHero = false;
-    const type = n.type.toLowerCase();
-
-    if (type.includes('vulnerab')) {
-      rfType = 'vulnerability';
-      icon = '🛡️';
-    } else if (type.includes('discuss') || type.includes('slack')) {
-      rfType = 'discussion';
-      icon = '💬';
-    } else if (type.includes('polic')) {
-      rfType = 'policy';
-      icon = '📋';
-    } else if (type.includes('package')) {
-      rfType = 'package';
-      icon = '📦';
-    } else if (type.includes('finding')) {
-      rfType = 'finding';
-      icon = '🔍';
-      width = 260;
-      height = 210;
-    } else if (type.includes('source') || type.includes('pr') || type.includes('github')) {
-      rfType = 'source';
-      icon = '🔗';
-    } else {
-      rfType = 'evidence';
-      icon = '📄';
-    }
-
-    dagreGraph.setNode(n.id, { width, height });
-
-    return {
-      id: n.id,
-      type: rfType,
-      position: { x: 0, y: 0 }, // Will be set by dagre
-      data: {
-        label: cleanNodeLabel(n.label),
-        type: n.type,
-        severity: n.severity,
-        score: n.score,
-        source: n.source,
-        url: n.url,
-        icon,
-        isHero,
-        layout
-      }
-    };
-  });
-
-  // Add edges to dagre
-  const rfEdges: Edge[] = edges.map((e, i) => {
-    dagreGraph.setEdge(e.from, e.to);
-    return {
-      id: `e-${e.from}-${e.to}-${i}`,
-      source: e.from,
-      target: e.to,
-      type: 'animated',
-      label: mapEdgeLabel(e.type),
-      data: { kind: e.type },
-    };
-  });
-
-  // Execute Layout
-  dagre.layout(dagreGraph);
-
-  // Apply computed positions to React Flow nodes
-  rfNodes.forEach((node) => {
-    const nodeWithPosition = dagreGraph.node(node.id);
-    // Dagre returns the center, React Flow needs the top-left
-    node.position = {
-      x: nodeWithPosition.x - nodeWithPosition.width / 2,
-      y: nodeWithPosition.y - nodeWithPosition.height / 2,
-    };
-    // Ensure all nodes have correct target and source positions for React Flow rendering
-    node.targetPosition = layout === 'LR' ? Position.Left : Position.Top;
-    node.sourcePosition = layout === 'LR' ? Position.Right : Position.Bottom;
-  });
-
-  return { nodes: rfNodes, edges: rfEdges };
-}
-
+// ─── Edge label map ─────────────────────────────────────────────────────────
 function mapEdgeLabel(type: string): string {
   const map: Record<string, string> = {
-    'HAS_VULNERABILITY': 'flags risk',
-    'HAS_EVIDENCE': 'supported by',
-    'VIOLATES_POLICY': 'policy conflict',
-    'AFFECTS': 'affects',
-    'INTRODUCED_BY': 'introduced by',
-    'DISCUSSED_IN': 'discussed in',
-    'RELATED_TO': 'related to'
+    introduced:    'introduces',
+    matched:       'matched',
+    documented_by: 'documented by',
+    violates:      'violates',
+    discussed_in:  'discussed in',
+    supported_by:  'supported by',
+    affects:       'affects',
+    related_to:    'related to',
   };
-  return map[type] || type.replace(/_/g, ' ').toLowerCase();
+  return map[type] ?? type.replace(/_/g, ' ').toLowerCase();
 }
 
-/** Clean up labels that contain raw JSON or overly long text */
+// ─── Label cleanup ───────────────────────────────────────────────────────────
 function cleanNodeLabel(label: string): string {
   if (label.includes('{"') || label.includes('[{')) {
     try {
@@ -166,123 +91,283 @@ function cleanNodeLabel(label: string): string {
       if (match) {
         const arr = JSON.parse(match[1]);
         if (Array.isArray(arr)) {
-          const ids = arr.map((item: Record<string, string>) => item.id || item.name || JSON.stringify(item)).slice(0, 3);
-          return ids.join(", ");
+          return (arr as Record<string, string>[])
+            .map(item => item.id || item.name || JSON.stringify(item))
+            .slice(0, 3)
+            .join(', ');
         }
       }
       const parsed = JSON.parse(label);
-      if (Array.isArray(parsed)) return parsed.map((x: Record<string, string>) => x.id || x.name || "").filter(Boolean).slice(0, 3).join(", ") || label;
-      if (typeof parsed === "object") return parsed.id || parsed.name || parsed.title || label;
+      if (Array.isArray(parsed))
+        return (parsed as Record<string, string>[])
+          .map(x => x.id || x.name || '')
+          .filter(Boolean)
+          .slice(0, 3)
+          .join(', ') || label;
+      if (typeof parsed === 'object')
+        return (parsed as Record<string, string>).id ||
+               (parsed as Record<string, string>).name ||
+               (parsed as Record<string, string>).title ||
+               label;
     } catch {
       const readable = label.split(/[{[]/)[0].trim();
       if (readable.length > 5) return readable;
     }
   }
-  if (label.length > 80) return label.slice(0, 77) + "…";
+  if (label.length > 90) return label.slice(0, 87) + '…';
   return label;
 }
 
-export function EvidenceGraph({ graph }: { graph?: { nodes?: GraphNode[], edges?: GraphEdge[] } }) {
-  const allNodes = graph?.nodes || [];
-  const allEdges = graph?.edges || [];
+// ─── Dagre layout ────────────────────────────────────────────────────────────
+const NODE_W = 290;
+const NODE_H = 200;
+
+function mapToReactFlowData(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  mode: LayoutMode,
+) {
+  const dagreGraph = new dagre.graphlib.Graph();
+  dagreGraph.setDefaultEdgeLabel(() => ({}));
+
+  const isHorizontal = mode !== 'hub' && mode !== 'cluster';
+  const rankdir  = isHorizontal ? 'LR' : 'TB';
+  const ranksep  = isHorizontal ? 220 : 180;
+  const nodesep  = isHorizontal ? 100 : 120;
+  const layout   = rankdir as 'LR' | 'TB';
+
+  dagreGraph.setGraph({ rankdir, ranksep, nodesep });
+
+  const rfNodes: ReactFlowNode<NodeData>[] = nodes.map(n => {
+    const type = n.type.toLowerCase();
+    let rfType = 'evidence';
+    if (type.includes('vulnerab') || type.includes('advis') || type.includes('alert'))
+      rfType = 'vulnerability';
+    else if (type.includes('discuss') || type.includes('slack'))
+      rfType = 'discussion';
+    else if (type.includes('polic'))
+      rfType = 'policy';
+    else if (type.includes('package'))
+      rfType = 'package';
+    else if (type.includes('finding'))
+      rfType = 'finding';
+    else if (type.includes('source') || type.includes('pr') || type.includes('pull') || type.includes('github'))
+      rfType = 'source';
+
+    dagreGraph.setNode(n.id, { width: NODE_W, height: NODE_H });
+
+    return {
+      id: n.id,
+      type: rfType,
+      position: { x: 0, y: 0 },
+      data: {
+        label:    cleanNodeLabel(n.label),
+        type:     n.type,
+        severity: n.severity,
+        score:    n.score,
+        source:   n.source,
+        url:      n.url,
+        layout,
+      },
+    };
+  });
+
+  const rfEdges: Edge[] = edges.map((e, i) => {
+    dagreGraph.setEdge(e.from, e.to);
+    return {
+      id:     `e-${e.from}-${e.to}-${i}`,
+      source: e.from,
+      target: e.to,
+      type:   'animated',
+      label:  mapEdgeLabel(e.type),
+      data:   { kind: e.type },
+    };
+  });
+
+  dagre.layout(dagreGraph);
+
+  rfNodes.forEach(node => {
+    const n = dagreGraph.node(node.id);
+    node.position = { x: n.x - n.width / 2, y: n.y - n.height / 2 };
+    node.targetPosition = layout === 'LR' ? Position.Left  : Position.Top;
+    node.sourcePosition = layout === 'LR' ? Position.Right : Position.Bottom;
+  });
+
+  return { nodes: rfNodes, edges: rfEdges };
+}
+
+// ─── Main Component ──────────────────────────────────────────────────────────
+export function EvidenceGraph({
+  graph,
+}: {
+  graph?: { nodes?: GraphNode[]; edges?: GraphEdge[] };
+}) {
+  const allNodes = graph?.nodes ?? [];
+  const allEdges = graph?.edges ?? [];
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(null);
-  
-  // 1. Resolve Topology
+
   const mode = resolveTopology(allNodes, allEdges);
 
-  // 2. Map to React Flow
   const { nodes: rfNodes, edges: rfEdges } = useMemo(() => {
     if (allNodes.length === 0) return { nodes: [], edges: [] };
     return mapToReactFlowData(allNodes, allEdges, mode);
   }, [allNodes, allEdges, mode]);
 
   if (allNodes.length === 0) {
-    return <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-3)' }}>No evidence graph available.</div>;
+    return (
+      <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-3)' }}>
+        No evidence graph available.
+      </div>
+    );
   }
 
   return (
-    <div className="graphCanvas">
-      
-      {/* Header */}
-      <div className="graphHeader">
-        <h2 className="graphHeaderTitle">Evidence map</h2>
-        <div className="graphHeaderMeta">
-          {allNodes.length} nodes and {allEdges.length} relationships
-        </div>
-      </div>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 0 }}>
 
-      <div className="graphGuide" aria-hidden="true">
-        <div className="graphGuideTitle">How to read</div>
-        <div className="graphGuideRow">
-          <span className="graphGuideDot" style={{ backgroundColor: '#f87171' }} />
-          Start with risk or finding cards.
+      {/* ── Header row: title + legend + controls ── */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '10px 16px',
+        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        flexShrink: 0,
+        flexWrap: 'wrap',
+        gap: 10,
+      }}>
+        {/* Left: title + stat */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: '0.72rem',
+            fontWeight: 700,
+            letterSpacing: '0.1em',
+            textTransform: 'uppercase',
+            color: '#e5e7eb',
+          }}>
+            Evidence Graph
+          </div>
+          <div style={{
+            fontSize: '0.68rem',
+            fontFamily: 'var(--font-mono)',
+            color: 'var(--text-3)',
+            padding: '2px 8px',
+            borderRadius: 999,
+            border: '1px solid rgba(255,255,255,0.07)',
+            background: 'rgba(255,255,255,0.03)',
+          }}>
+            {allNodes.length} nodes · {allEdges.length} edges
+          </div>
         </div>
-        <div className="graphGuideRow">
-          <span className="graphGuideDot" style={{ backgroundColor: '#fb923c' }} />
-          Follow arrows to supporting evidence.
-        </div>
-        <div className="graphGuideRow">
-          <span className="graphGuideDot" style={{ backgroundColor: '#60a5fa' }} />
-          Dashed links add policy or discussion context.
-        </div>
-      </div>
 
-      {/* Top Right Controls */}
-      <div className="graphControls">
-        <button className="graphControlBtn" onClick={() => flowInstance?.fitView({ padding: 0.2, duration: 400 })}>
-          Fit view
-        </button>
-        <button className="graphControlBtn" aria-label="Zoom out" onClick={() => flowInstance?.zoomOut({ duration: 200 })}>
-          -
-        </button>
-        <button className="graphControlBtn" aria-label="Zoom in" onClick={() => flowInstance?.zoomIn({ duration: 200 })}>
-          +
-        </button>
-      </div>
-
-      {/* Legend */}
-      <div className="graphLegend" aria-hidden="true">
-        <div className="graphLegendTitle">Legend</div>
-        <div className="graphLegendList">
-          {[
-            { label: 'Source', desc: 'PRs, commits, alerts', color: '#a78bfa' },
-            { label: 'Entity', desc: 'Packages and assets', color: '#fb923c' },
-            { label: 'Finding', desc: 'Investigation output', color: '#f59e0b' },
-            { label: 'Vulnerability', desc: 'Known risk signals', color: '#f87171' },
-            { label: 'Discussion', desc: 'Human context', color: '#60a5fa' },
-            { label: 'Policy', desc: 'Rules and controls', color: '#34d399' },
-            { label: 'Evidence', desc: 'Supporting records', color: '#9ca3af' },
-          ].map(item => (
-            <div key={item.label} className="graphLegendItem">
-              <span className="graphLegendDot" style={{ backgroundColor: item.color }} />
-              <div>
-                <div className="graphLegendLabel">{item.label}</div>
-                <div className="graphLegendDesc">{item.desc}</div>
-              </div>
+        {/* Center: compact legend */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+          {LEGEND.map(item => (
+            <div
+              key={item.key}
+              style={{ display: 'flex', alignItems: 'center', gap: 5 }}
+            >
+              <span style={{
+                width: 8,
+                height: 8,
+                borderRadius: '50%',
+                background: item.color,
+                flexShrink: 0,
+              }} />
+              <span style={{
+                fontSize: '0.68rem',
+                fontFamily: 'var(--font-mono)',
+                color: 'rgba(200,196,215,0.7)',
+                whiteSpace: 'nowrap',
+              }}>
+                {item.label}
+              </span>
             </div>
           ))}
         </div>
+
+        {/* Right: controls */}
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          <button
+            className="graphControlBtn"
+            onClick={() => flowInstance?.fitView({ padding: 0.18, duration: 450 })}
+          >
+            Fit view
+          </button>
+          <button
+            className="graphControlBtn"
+            aria-label="Zoom out"
+            onClick={() => flowInstance?.zoomOut({ duration: 200 })}
+          >
+            −
+          </button>
+          <button
+            className="graphControlBtn"
+            aria-label="Zoom in"
+            onClick={() => flowInstance?.zoomIn({ duration: 200 })}
+          >
+            +
+          </button>
+        </div>
       </div>
 
-      <ReactFlow
-        nodes={rfNodes}
-        edges={rfEdges}
-        nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
-        defaultEdgeOptions={defaultEdgeOptions}
-        fitView
-        fitViewOptions={{ padding: 0.2 }}
-        onInit={setFlowInstance}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        panOnDrag
-        panOnScroll={false}
-        zoomOnScroll={false}
-        zoomOnDoubleClick={false}
-        preventScrolling={false}
-      >
-        <Background gap={20} color="rgba(255, 255, 255, 0.05)" size={2} />
-      </ReactFlow>
+      {/* ── Canvas ── */}
+      <div style={{
+        flex: 1,
+        minHeight: 0,
+        position: 'relative',
+        borderRadius: '0 0 10px 10px',
+        overflow: 'hidden',
+        background: `
+          radial-gradient(ellipse at 15% 20%, rgba(96,165,250,0.07) 0%, transparent 50%),
+          radial-gradient(ellipse at 85% 80%, rgba(248,113,113,0.07) 0%, transparent 45%),
+          #0e0d13
+        `,
+      }}>
+        <ReactFlow
+          nodes={rfNodes}
+          edges={rfEdges}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          defaultEdgeOptions={defaultEdgeOptions}
+          fitView
+          fitViewOptions={{ padding: 0.18 }}
+          onInit={setFlowInstance}
+          nodesDraggable={true}
+          nodesConnectable={false}
+          panOnDrag
+          panOnScroll={false}
+          zoomOnScroll={true}
+          zoomOnDoubleClick={false}
+          preventScrolling={false}
+          minZoom={0.3}
+          maxZoom={2}
+        >
+          <Background
+            gap={28}
+            color="rgba(255,255,255,0.035)"
+            size={1.2}
+          />
+        </ReactFlow>
+
+        {/* Subtle flow direction hint — bottom right */}
+        <div style={{
+          position: 'absolute',
+          bottom: 12,
+          right: 14,
+          fontSize: '0.62rem',
+          fontFamily: 'var(--font-mono)',
+          color: 'rgba(160,153,180,0.4)',
+          pointerEvents: 'none',
+          userSelect: 'none',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+        }}>
+          <span style={{ width: 20, height: 1, background: 'rgba(255,255,255,0.12)', display: 'inline-block' }} />
+          causal flow →
+        </div>
+      </div>
     </div>
   );
 }

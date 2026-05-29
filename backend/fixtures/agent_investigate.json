@@ -1,0 +1,530 @@
+{
+  "question": "What risky security and compliance changes need review?",
+  "answer": "HarborGuard found 3 security or compliance finding(s).",
+  "risk_level": "high",
+  "score": 75,
+  "findings": [
+    {
+      "type": "known_vulnerability",
+      "title": "Dependabot reports minimist vulnerability",
+      "severity": "high",
+      "score": 75,
+      "evidence": [
+        {
+          "source": "github.alerts",
+          "text": "Prototype Pollution in minimist – a maliciously crafted CLI argument can overwrite Object.prototype properties.",
+          "url": "https://github.com/withcoral/coral/security/dependabot/1"
+        }
+      ],
+      "policy_context": [
+        {
+          "source": "notion.search",
+          "text": "Dependency Security Review Policy (DEP-001)",
+          "url": "https://notion.so/dependency-security-review-policy"
+        }
+      ],
+      "discussion_context": [
+        {
+          "source": "slack.messages",
+          "text": "Heads up – minimist upgrade is a temporary bypass until the CLI refactor lands next sprint.",
+          "url": null
+        }
+      ],
+      "recommendation": "Require security review before release."
+    },
+    {
+      "type": "vulnerable_dependency",
+      "title": "minimist@0.0.8 has vulnerability evidence",
+      "severity": "high",
+      "score": 70,
+      "evidence": [
+        {
+          "source": "osv.query_by_version",
+          "text": "Prototype Pollution in minimist",
+          "url": "https://osv.dev/vulnerability/GHSA-vh95-rmgr-6w4m"
+        },
+        {
+          "source": "deps_dev.versions",
+          "text": "deps.dev advisory keys: ['GHSA-vh95-rmgr-6w4m', 'CVE-2021-44906']",
+          "url": null
+        },
+        {
+          "source": "deps_dev.advisories",
+          "text": "Prototype Pollution in minimist (CVSS 9.8)",
+          "url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m"
+        }
+      ],
+      "policy_context": [
+        {
+          "source": "notion.search",
+          "text": "Dependency Security Review Policy (DEP-001)",
+          "url": "https://notion.so/dependency-security-review-policy"
+        }
+      ],
+      "discussion_context": [
+        {
+          "source": "slack.messages",
+          "text": "Heads up – minimist upgrade is a temporary bypass until the CLI refactor lands next sprint.",
+          "url": null
+        }
+      ],
+      "recommendation": "Require security review before release."
+    },
+    {
+      "type": "risky_change",
+      "title": "2 recent merged pull request(s) mention sensitive areas",
+      "severity": "medium",
+      "score": 45,
+      "evidence": [
+        {
+          "source": "github.pulls",
+          "text": "PR #42: Upgrade minimist for legacy CLI support",
+          "url": "https://github.com/withcoral/coral/pull/42"
+        },
+        {
+          "source": "github.pulls",
+          "text": "PR #38: Relax admin session timeout for support debugging",
+          "url": "https://github.com/withcoral/coral/pull/38"
+        }
+      ],
+      "policy_context": [
+        {
+          "source": "notion.search",
+          "text": "Dependency Security Review Policy (DEP-001)",
+          "url": "https://notion.so/dependency-security-review-policy"
+        }
+      ],
+      "discussion_context": [
+        {
+          "source": "slack.messages",
+          "text": "Heads up – minimist upgrade is a temporary bypass until the CLI refactor lands next sprint.",
+          "url": null
+        }
+      ],
+      "recommendation": "Ask the security reviewer to inspect these changes."
+    }
+  ],
+  "evidence_graph": {
+    "nodes": [
+      {
+        "id": "pkg:npm:minimist:0.0.8",
+        "type": "package",
+        "label": "minimist@0.0.8"
+      },
+      {
+        "id": "vuln:GHSA-vh95-rmgr-6w4m",
+        "type": "vulnerability",
+        "label": "Prototype Pollution in minimist",
+        "source": "osv.query_by_version",
+        "url": "https://osv.dev/vulnerability/GHSA-vh95-rmgr-6w4m",
+        "severity": "high",
+        "score": 70
+      },
+      {
+        "id": "evidence:2:2",
+        "type": "evidence",
+        "label": "deps.dev advisory keys: ['GHSA-vh95-rmgr-6w4m', 'CVE-2021-44906']",
+        "source": "deps_dev.versions",
+        "url": null
+      },
+      {
+        "id": "evidence:2:3",
+        "type": "vulnerability",
+        "label": "Prototype Pollution in minimist (CVSS 9.8)",
+        "source": "deps_dev.advisories",
+        "url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m"
+      },
+      {
+        "id": "evidence:3:1",
+        "type": "pull_request",
+        "label": "PR #42: Upgrade minimist for legacy CLI support",
+        "source": "github.pulls",
+        "url": "https://github.com/withcoral/coral/pull/42"
+      },
+      {
+        "id": "evidence:3:2",
+        "type": "pull_request",
+        "label": "PR #38: Relax admin session timeout for support debugging",
+        "source": "github.pulls",
+        "url": "https://github.com/withcoral/coral/pull/38"
+      },
+      {
+        "id": "policy:1:1",
+        "type": "policy",
+        "label": "Dependency Security Review Policy (DEP-001)",
+        "source": "notion.search",
+        "url": "https://notion.so/dependency-security-review-policy"
+      },
+      {
+        "id": "discussion:1:1",
+        "type": "discussion",
+        "label": "Heads up – minimist upgrade is a temporary bypass until the CLI refactor lands next sprint.",
+        "source": "slack.messages"
+      }
+    ],
+    "edges": [
+      {
+        "from": "evidence:3:1",
+        "to": "pkg:npm:minimist:0.0.8",
+        "type": "introduced"
+      },
+      {
+        "from": "evidence:3:2",
+        "to": "pkg:npm:minimist:0.0.8",
+        "type": "introduced"
+      },
+      {
+        "from": "pkg:npm:minimist:0.0.8",
+        "to": "vuln:GHSA-vh95-rmgr-6w4m",
+        "type": "matched"
+      },
+      {
+        "from": "vuln:GHSA-vh95-rmgr-6w4m",
+        "to": "evidence:2:2",
+        "type": "documented_by"
+      },
+      {
+        "from": "vuln:GHSA-vh95-rmgr-6w4m",
+        "to": "evidence:2:3",
+        "type": "documented_by"
+      },
+      {
+        "from": "vuln:GHSA-vh95-rmgr-6w4m",
+        "to": "policy:1:1",
+        "type": "violates"
+      },
+      {
+        "from": "pkg:npm:minimist:0.0.8",
+        "to": "discussion:1:1",
+        "type": "discussed_in"
+      }
+    ]
+  },
+  "reasoning_trace": [
+    "Discovered Coral source and tool metadata before planning.",
+    "Selected github.pulls: question needs recent code/change context.",
+    "Selected github.alerts: question needs GitHub dependency alert context.",
+    "Selected deps_dev.versions: question needs package metadata.",
+    "Selected deps_dev.dependencies: question needs dependency context.",
+    "Selected deps_dev.advisories: question needs advisory detail.",
+    "Selected osv.query_by_version: question needs vulnerability lookup.",
+    "Selected notion.search: question needs internal policy context.",
+    "Skipped slack.messages: slack_channel was not provided.",
+    "LLM planner used deterministic fallback.",
+    "Executed 8 selected investigation step(s).",
+    "Generated 3 finding(s) with maximum score 75."
+  ],
+  "planner": {
+    "intent": {
+      "dependency_risk": true,
+      "policy_review": true,
+      "discussion_context": false,
+      "secret_detection": false,
+      "change_risk": true
+    },
+    "selected_tools": [
+      "github.pulls",
+      "github.alerts",
+      "deps_dev.versions",
+      "deps_dev.dependencies",
+      "deps_dev.advisories",
+      "osv.query_by_version",
+      "notion.search"
+    ],
+    "skipped_tools": [
+      {
+        "tool": "github.search_code",
+        "reason": "question does not request secret detection"
+      },
+      {
+        "tool": "slack.messages",
+        "reason": "slack_channel was not provided"
+      }
+    ],
+    "reasoning_trace": [
+      "Discovered Coral source and tool metadata before planning.",
+      "Selected github.pulls: question needs recent code/change context.",
+      "Selected github.alerts: question needs GitHub dependency alert context.",
+      "Selected deps_dev.versions: question needs package metadata.",
+      "Selected deps_dev.dependencies: question needs dependency context.",
+      "Selected deps_dev.advisories: question needs advisory detail.",
+      "Selected osv.query_by_version: question needs vulnerability lookup.",
+      "Selected notion.search: question needs internal policy context.",
+      "Skipped slack.messages: slack_channel was not provided."
+    ],
+    "planner_source": "deterministic"
+  },
+  "capability_summary": {
+    "required_source_count": 5,
+    "available_source_count": 5,
+    "available_tool_count": 8,
+    "metadata_ok": true,
+    "unavailable_sources": [],
+    "unconfigured_sources": []
+  },
+  "steps": [
+    {
+      "name": "github_recent_pulls",
+      "ok": true,
+      "rows": [
+        {
+          "number": 42,
+          "title": "Upgrade minimist for legacy CLI support",
+          "body": "Bumps minimist from 0.0.8 to 0.0.9 to unblock the CLI team. Temporary – will revisit after the refactor.",
+          "user__login": "dev-person",
+          "merged_at": "2026-05-20T14:23:00Z",
+          "html_url": "https://github.com/withcoral/coral/pull/42",
+          "label_names": "dependency"
+        },
+        {
+          "number": 38,
+          "title": "Relax admin session timeout for support debugging",
+          "body": "Extends the admin session timeout from 15 min to 60 min to allow the support team to debug live issues.",
+          "user__login": "admin-person",
+          "merged_at": "2026-05-18T09:10:00Z",
+          "html_url": "https://github.com/withcoral/coral/pull/38",
+          "label_names": "auth,admin"
+        }
+      ],
+      "sql": "SELECT number, title, body, user__login, merged_at, url, label_names FROM github.pulls WHERE owner = 'withcoral' AND repo = 'coral' AND state = 'closed' AND merged_at IS NOT NULL ORDER BY merged_at DESC LIMIT 20",
+      "error": null,
+      "duration_ms": 312
+    },
+    {
+      "name": "github_dependabot_alerts",
+      "ok": true,
+      "rows": [
+        {
+          "number": 1,
+          "state": "open",
+          "dependency__package__ecosystem": "npm",
+          "dependency__package__name": "minimist",
+          "security_advisory__severity": "high",
+          "security_advisory__summary": "Prototype Pollution in minimist – a maliciously crafted CLI argument can overwrite Object.prototype properties.",
+          "html_url": "https://github.com/withcoral/coral/security/dependabot/1",
+          "created_at": "2026-05-19T12:00:00Z"
+        }
+      ],
+      "sql": "SELECT number, state, dependency__package__ecosystem, dependency__package__name, security_advisory__severity, security_advisory__summary, html_url, created_at FROM github.alerts WHERE org = 'withcoral' AND state = 'open' LIMIT 20",
+      "error": null,
+      "duration_ms": 278
+    },
+    {
+      "name": "github_secret_file_search",
+      "ok": true,
+      "skipped": true,
+      "rows": [],
+      "sql": null,
+      "error": null,
+      "reason": "question does not request secret detection",
+      "duration_ms": 0
+    },
+    {
+      "name": "deps_dev_package_version",
+      "ok": true,
+      "rows": [
+        {
+          "version": "0.0.8",
+          "published_at": "2013-01-01T00:00:00Z",
+          "licenses": "MIT",
+          "advisory_keys": "[\"GHSA-vh95-rmgr-6w4m\", \"CVE-2021-44906\"]",
+          "related_projects": null,
+          "links": null
+        }
+      ],
+      "sql": "SELECT version, published_at, licenses, advisory_keys, related_projects, links FROM deps_dev.versions WHERE system = 'NPM' AND package_name = 'minimist' AND version = '0.0.8' LIMIT 1",
+      "error": null,
+      "duration_ms": 201
+    },
+    {
+      "name": "deps_dev_dependencies",
+      "ok": true,
+      "rows": [],
+      "sql": "SELECT dependency_name, dependency_version, relation FROM deps_dev.dependencies WHERE system = 'NPM' AND package_name = 'minimist' AND version = '0.0.8' LIMIT 20",
+      "error": null,
+      "duration_ms": 195
+    },
+    {
+      "name": "osv_package_vulnerabilities",
+      "ok": true,
+      "rows": [
+        {
+          "id": "GHSA-vh95-rmgr-6w4m",
+          "summary": "Prototype Pollution in minimist",
+          "severity": "HIGH",
+          "references": "[{\"type\": \"ADVISORY\", \"url\": \"https://github.com/advisories/GHSA-vh95-rmgr-6w4m\"}]"
+        }
+      ],
+      "sql": "SELECT id, summary, severity, references FROM osv.query_by_version WHERE package_name = 'minimist' AND ecosystem = 'npm' AND version = '0.0.8' LIMIT 20",
+      "error": null,
+      "duration_ms": 432
+    },
+    {
+      "name": "notion_policy_context",
+      "ok": true,
+      "rows": [
+        {
+          "id": "notion-page-dep-001",
+          "object": "page",
+          "url": "https://notion.so/dependency-security-review-policy",
+          "public_url": null,
+          "raw": "{\"title\": \"Dependency Security Review Policy (DEP-001)\", \"body\": \"All dependency upgrades introducing a known CVE require a security review sign-off before release.\"}"
+        }
+      ],
+      "sql": "SELECT id, object, url, public_url, raw FROM notion.search WHERE query = 'dependency security review secrets access control' LIMIT 5",
+      "error": null,
+      "duration_ms": 388
+    },
+    {
+      "name": "deps_dev_advisories",
+      "ok": true,
+      "rows": [
+        {
+          "advisory_id": "GHSA-vh95-rmgr-6w4m",
+          "title": "Prototype Pollution in minimist",
+          "advisory_url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m",
+          "cvss3_score": 9.8,
+          "aliases": "[\"CVE-2021-44906\"]"
+        }
+      ],
+      "sql": "SELECT advisory_id, title, advisory_url, cvss3_score, aliases FROM deps_dev.advisories WHERE advisory_id IN ('GHSA-vh95-rmgr-6w4m') LIMIT 20",
+      "error": null,
+      "duration_ms": 167
+    },
+    {
+      "name": "slack_security_discussion",
+      "ok": true,
+      "skipped": true,
+      "rows": [],
+      "sql": null,
+      "error": null,
+      "reason": "slack_channel was not provided",
+      "duration_ms": 0
+    }
+  ],
+  "metadata_steps": [],
+  "debug_timeline": [
+    {
+      "phase": "metadata",
+      "name": "discover_capabilities",
+      "ok": true,
+      "duration_ms": 120
+    },
+    {
+      "phase": "planning",
+      "name": "deterministic",
+      "ok": true,
+      "duration_ms": 5,
+      "selected_tools": [
+        "github.pulls",
+        "github.alerts",
+        "deps_dev.versions",
+        "deps_dev.dependencies",
+        "deps_dev.advisories",
+        "osv.query_by_version",
+        "notion.search"
+      ],
+      "fallback_reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "github_recent_pulls",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 312,
+      "rows": 2,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "github_dependabot_alerts",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 278,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "github_secret_file_search",
+      "ok": true,
+      "skipped": true,
+      "duration_ms": 0,
+      "rows": 0,
+      "error": null,
+      "reason": "question does not request secret detection"
+    },
+    {
+      "phase": "execution",
+      "name": "deps_dev_package_version",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 201,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "deps_dev_dependencies",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 195,
+      "rows": 0,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "osv_package_vulnerabilities",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 432,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "notion_policy_context",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 388,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "deps_dev_advisories",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 167,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "slack_security_discussion",
+      "ok": true,
+      "skipped": true,
+      "duration_ms": 0,
+      "rows": 0,
+      "error": null,
+      "reason": "slack_channel was not provided"
+    },
+    {
+      "phase": "synthesis",
+      "name": "risk_assessment",
+      "ok": true,
+      "duration_ms": 2100
+    }
+  ],
+  "source_status": {
+    "ok": true,
+    "failed_steps": []
+  }
+}

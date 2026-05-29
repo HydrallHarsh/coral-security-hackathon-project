@@ -16,3 +16,5 @@ wheels/
 .venv/
 backend/.venv/
 .coral-config/
+coral-download/
+skills-lock.json

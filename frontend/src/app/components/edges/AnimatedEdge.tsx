@@ -1,6 +1,16 @@
 import React from 'react';
-import { BaseEdge, EdgeLabelRenderer, EdgeProps, getSmoothStepPath } from '@xyflow/react';
+import { EdgeLabelRenderer, EdgeProps, getSmoothStepPath } from '@xyflow/react';
 
+/**
+ * Zapier / n8n style lightning-bolt animated edge.
+ *
+ * 3 layers:
+ *   1. Faint "track" — always visible base line
+ *   2. Blurred "aura" — purple glow dash that moves (CSS class .bolt-aura)
+ *   3. Bright "core" — white dash on top (CSS class .bolt-core)
+ *
+ * The animation keyframes live in globals.css so they actually work.
+ */
 export function AnimatedEdge({
   id,
   sourceX,
@@ -9,48 +19,75 @@ export function AnimatedEdge({
   targetY,
   sourcePosition,
   targetPosition,
-  style = {},
   markerEnd,
   label,
-  data,
 }: EdgeProps) {
   const [edgePath, labelX, labelY] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    sourcePosition,
-    targetX,
-    targetY,
-    targetPosition,
-    borderRadius: 0,
+    sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition,
+    borderRadius: 16,
   });
-
-  const edgeKind = typeof (data as { kind?: string } | undefined)?.kind === 'string'
-    ? (data as { kind?: string }).kind!.toLowerCase()
-    : '';
-  const labelText = typeof label === 'string' ? label.toLowerCase() : '';
-  const isContext = edgeKind.includes('policy') || edgeKind.includes('discuss') || labelText.includes('policy') || labelText.includes('discuss');
-  const isDashed = isContext || labelText.includes('context');
-  const strokeDasharray = isDashed ? '4 4' : 'none';
-  const strokeColor = isContext ? 'rgba(96, 165, 250, 0.4)' : 'rgba(255, 255, 255, 0.25)';
 
   return (
     <>
-      <BaseEdge path={edgePath} markerEnd={markerEnd} style={{ ...style, strokeWidth: 1.5, stroke: strokeColor, strokeDasharray }} />
+      {/* SVG filter for the glow */}
+      <defs>
+        <filter id={`glow-${id}`} x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="3.5" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+
+      {/* 1 — faint track */}
+      <path
+        d={edgePath}
+        fill="none"
+        stroke="rgba(255,255,255,0.07)"
+        strokeWidth={1.5}
+      />
+
+      {/* 2 — glow aura */}
+      <path
+        className="bolt-aura"
+        d={edgePath}
+        fill="none"
+        stroke="rgba(167,139,250,0.4)"
+        strokeWidth={5}
+        strokeDasharray="20 180"
+        strokeLinecap="round"
+        filter={`url(#glow-${id})`}
+      />
+
+      {/* 3 — bright core */}
+      <path
+        className="bolt-core"
+        d={edgePath}
+        fill="none"
+        stroke="rgba(255,255,255,0.85)"
+        strokeWidth={1.5}
+        strokeDasharray="20 180"
+        strokeLinecap="round"
+        markerEnd={markerEnd as string}
+      />
+
       {label && (
         <EdgeLabelRenderer>
           <div
             style={{
               position: 'absolute',
               transform: `translate(-50%, -50%) translate(${labelX}px,${labelY}px)`,
-              background: 'rgba(9, 9, 11, 0.9)',
-              padding: '2px 6px',
+              background: 'rgba(14,13,19,0.95)',
+              padding: '3px 8px',
               fontSize: '0.65rem',
               fontFamily: 'var(--font-mono)',
-              color: 'var(--text-3)',
-              border: '1px solid rgba(255, 255, 255, 0.08)',
-              borderRadius: '6px',
+              color: 'rgba(200,196,215,0.8)',
               pointerEvents: 'none',
               zIndex: 10,
+              borderRadius: 4,
+              border: '1px solid rgba(255,255,255,0.06)',
+              whiteSpace: 'nowrap',
             }}
           >
             {label}

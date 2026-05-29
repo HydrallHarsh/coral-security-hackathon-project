@@ -1,0 +1,164 @@
+{
+  "risk_level": "high",
+  "severity": "high",
+  "score": 70,
+  "summary": "OSV reports vulnerabilities for this package version. deps.dev advisory details are available.",
+  "recommendation": "Require security review before release.",
+  "evidence": [
+    {
+      "source": "osv.query_by_version",
+      "text": "Prototype Pollution in minimist",
+      "url": "https://osv.dev/vulnerability/GHSA-vh95-rmgr-6w4m"
+    },
+    {
+      "source": "deps_dev.versions",
+      "text": "deps.dev advisory keys: ['GHSA-vh95-rmgr-6w4m', 'CVE-2021-44906']",
+      "url": null
+    },
+    {
+      "source": "deps_dev.advisories",
+      "text": "Prototype Pollution in minimist (CVSS 9.8)",
+      "url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m"
+    }
+  ],
+  "sql": {
+    "osv": "SELECT id, summary, severity, references FROM osv.query_by_version WHERE package_name = 'minimist' AND ecosystem = 'npm' AND version = '0.0.8' LIMIT 20",
+    "deps_dev_version": "SELECT version, published_at, licenses, advisory_keys, related_projects, links FROM deps_dev.versions WHERE system = 'NPM' AND package_name = 'minimist' AND version = '0.0.8' LIMIT 1",
+    "deps_dev_dependencies": "SELECT dependency_name, dependency_version, relation FROM deps_dev.dependencies WHERE system = 'NPM' AND package_name = 'minimist' AND version = '0.0.8' LIMIT 20",
+    "deps_dev_advisories": "SELECT advisory_id, title, advisory_url, cvss3_score, aliases FROM deps_dev.advisories WHERE advisory_id IN ('GHSA-vh95-rmgr-6w4m') LIMIT 20"
+  },
+  "findings": [
+    {
+      "type": "vulnerable_dependency",
+      "title": "minimist@0.0.8 has vulnerability evidence",
+      "severity": "high",
+      "score": 70,
+      "evidence": [
+        {
+          "source": "osv.query_by_version",
+          "text": "Prototype Pollution in minimist",
+          "url": "https://osv.dev/vulnerability/GHSA-vh95-rmgr-6w4m"
+        },
+        {
+          "source": "deps_dev.versions",
+          "text": "deps.dev advisory keys: ['GHSA-vh95-rmgr-6w4m', 'CVE-2021-44906']",
+          "url": null
+        },
+        {
+          "source": "deps_dev.advisories",
+          "text": "Prototype Pollution in minimist (CVSS 9.8)",
+          "url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m"
+        }
+      ],
+      "policy_context": [],
+      "discussion_context": [],
+      "recommendation": "Require security review before release."
+    }
+  ],
+  "steps": [
+    {
+      "name": "deps_dev_package_version",
+      "ok": true,
+      "rows": [
+        {
+          "version": "0.0.8",
+          "published_at": "2013-01-01T00:00:00Z",
+          "licenses": "MIT",
+          "advisory_keys": "[\"GHSA-vh95-rmgr-6w4m\", \"CVE-2021-44906\"]",
+          "related_projects": null,
+          "links": null
+        }
+      ],
+      "sql": "SELECT version, published_at, licenses, advisory_keys, related_projects, links FROM deps_dev.versions WHERE system = 'NPM' AND package_name = 'minimist' AND version = '0.0.8' LIMIT 1",
+      "error": null,
+      "duration_ms": 201
+    },
+    {
+      "name": "deps_dev_dependencies",
+      "ok": true,
+      "rows": [],
+      "sql": "SELECT dependency_name, dependency_version, relation FROM deps_dev.dependencies WHERE system = 'NPM' AND package_name = 'minimist' AND version = '0.0.8' LIMIT 20",
+      "error": null,
+      "duration_ms": 195
+    },
+    {
+      "name": "deps_dev_advisories",
+      "ok": true,
+      "rows": [
+        {
+          "advisory_id": "GHSA-vh95-rmgr-6w4m",
+          "title": "Prototype Pollution in minimist",
+          "advisory_url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m",
+          "cvss3_score": 9.8,
+          "aliases": "[\"CVE-2021-44906\"]"
+        }
+      ],
+      "sql": "SELECT advisory_id, title, advisory_url, cvss3_score, aliases FROM deps_dev.advisories WHERE advisory_id IN ('GHSA-vh95-rmgr-6w4m') LIMIT 20",
+      "error": null,
+      "duration_ms": 167
+    },
+    {
+      "name": "osv_package_vulnerabilities",
+      "ok": true,
+      "rows": [
+        {
+          "id": "GHSA-vh95-rmgr-6w4m",
+          "summary": "Prototype Pollution in minimist",
+          "severity": "HIGH",
+          "references": "[{\"type\": \"ADVISORY\", \"url\": \"https://github.com/advisories/GHSA-vh95-rmgr-6w4m\"}]"
+        }
+      ],
+      "sql": "SELECT id, summary, severity, references FROM osv.query_by_version WHERE package_name = 'minimist' AND ecosystem = 'npm' AND version = '0.0.8' LIMIT 20",
+      "error": null,
+      "duration_ms": 432
+    }
+  ],
+  "debug_timeline": [
+    {
+      "phase": "execution",
+      "name": "deps_dev_package_version",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 201,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "deps_dev_dependencies",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 195,
+      "rows": 0,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "deps_dev_advisories",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 167,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "execution",
+      "name": "osv_package_vulnerabilities",
+      "ok": true,
+      "skipped": false,
+      "duration_ms": 432,
+      "rows": 1,
+      "error": null,
+      "reason": null
+    },
+    {
+      "phase": "synthesis",
+      "name": "risk_assessment",
+      "ok": true,
+      "duration_ms": 995
+    }
+  ]
+}

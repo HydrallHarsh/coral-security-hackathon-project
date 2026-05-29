@@ -1,9 +1,13 @@
 import json
+import logging
 import os
 import socket
+import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+logger = logging.getLogger("harborguard.llm")
 
 
 class LLMPlannerError(RuntimeError):
@@ -84,6 +88,7 @@ def plan_with_openrouter(
     allowed_tools: list[str],
 ) -> dict[str, Any]:
     if not llm_planner_enabled():
+        logger.info("llm.planner.skipped reason=disabled")
         raise LLMPlannerError("LLM planner is disabled")
 
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -93,7 +98,14 @@ def plan_with_openrouter(
     if not model:
         raise LLMPlannerError("OPENROUTER_MODEL is not set")
 
+    started_at = time.perf_counter()
     available_tools = _compact_tools(capabilities)
+    logger.info(
+        "llm.openrouter.start model=%s available_tools=%s allowed_tools=%s",
+        model,
+        len(available_tools),
+        len(allowed_tools),
+    )
     payload = {
         "model": model,
         "temperature": 0.1,
@@ -150,16 +162,37 @@ def plan_with_openrouter(
             response_body = response.read().decode("utf-8")
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
+        logger.warning(
+            "llm.openrouter.http_error duration_ms=%s status=%s body=%s",
+            elapsed_ms(started_at),
+            error.code,
+            compact_text(body),
+        )
         raise LLMPlannerError(f"OpenRouter HTTP {error.code}: {body}") from error
     except urllib.error.URLError as error:
+        logger.warning(
+            "llm.openrouter.failed duration_ms=%s error=%s",
+            elapsed_ms(started_at),
+            compact_text(str(error)),
+        )
         raise LLMPlannerError(f"OpenRouter request failed: {error}") from error
     except (TimeoutError, socket.timeout) as error:
+        logger.warning(
+            "llm.openrouter.timeout duration_ms=%s timeout=%ss",
+            elapsed_ms(started_at),
+            f"{timeout_seconds:g}",
+        )
         raise LLMPlannerError("OpenRouter request timed out") from error
 
     try:
         data = json.loads(response_body)
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
+        logger.warning(
+            "llm.openrouter.invalid_response duration_ms=%s error=%s",
+            elapsed_ms(started_at),
+            compact_text(str(error)),
+        )
         raise LLMPlannerError("OpenRouter response did not contain chat content") from error
 
     plan = _extract_json_object(content)
@@ -195,6 +228,12 @@ def plan_with_openrouter(
             {"tool": str(tool), "reason": "rejected because it is not an allowed tool"}
         )
 
+    logger.info(
+        "llm.openrouter.ok duration_ms=%s selected_tools=%s rejected_tools=%s",
+        elapsed_ms(started_at),
+        len(valid_selected),
+        len(invalid_selected),
+    )
     return {
         "intent": str(plan.get("intent") or "llm_planned_investigation"),
         "selected_tools": valid_selected,
@@ -206,3 +245,13 @@ def plan_with_openrouter(
         "planner_source": "openrouter",
         "model": model,
     }
+
+
+def elapsed_ms(started_at: float) -> int:
+    return round((time.perf_counter() - started_at) * 1000)
+
+
+def compact_text(text: str, limit: int = 320) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."

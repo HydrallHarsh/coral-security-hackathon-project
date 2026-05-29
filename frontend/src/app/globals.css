@@ -137,7 +137,7 @@ h1, h2, h3, h4 {
 
 .bCenter {
   width: 100%;
-  max-width: 720px;
+  max-width: 920px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -240,6 +240,10 @@ h1, h2, h3, h4 {
   box-shadow: 0 0 24px var(--accent-glow);
 }
 
+.qForm {
+  width: 100%;
+}
+
 /* Question Area */
 .qArea {
   width: 100%;
@@ -309,23 +313,31 @@ h1, h2, h3, h4 {
 }
 
 .cfgSummary {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
-  color: var(--text-3);
+  gap: 8px;
+  font-family: var(--font-body);
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: var(--text);
   cursor: pointer;
-  padding: 8px;
+  padding: 10px 20px;
   border-radius: var(--radius-sm);
-  transition: color 0.2s;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  transition: all 0.2s var(--ease);
   user-select: none;
   list-style: none;
+  margin: 0 auto;
 }
 
 .cfgSummary::-webkit-details-marker { display: none; }
-.cfgSummary:hover { color: var(--accent); }
+.cfgSummary:hover { 
+  background: var(--surface);
+  border-color: var(--border-h);
+  color: var(--accent);
+}
 
 .cfgGrid {
   display: grid;
@@ -724,7 +736,8 @@ h1, h2, h3, h4 {
 /* ─── Main Area ─── */
 .mainArea {
   display: grid;
-  grid-template-columns: 1fr 380px;
+  /* ~70% graph, ~30% findings — matches the reference layout */
+  grid-template-columns: 1fr minmax(300px, 360px);
   gap: 14px;
   min-height: 0;
 }
@@ -766,71 +779,38 @@ h1, h2, h3, h4 {
 }
 
 /* ═══════════════════════════════════════════════
-   EVIDENCE GRAPH — Hierarchical Flow
+   EVIDENCE GRAPH — Clean Flow
    ═══════════════════════════════════════════════ */
 .graphPanel {
   background: var(--surface-solid);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 22px;
   animation: fadeUp 0.5s var(--ease) 0.1s backwards;
   overflow: hidden;
-}
-
-.graphCanvas {
-  position: relative;
-  width: 100%;
-  height: 520px;
-  border-radius: calc(var(--radius) - 4px);
-  overflow: hidden;
-  background:
-    radial-gradient(circle at 20% 20%, rgba(96, 165, 250, 0.08), transparent 55%),
-    radial-gradient(circle at 80% 15%, rgba(232, 105, 63, 0.08), transparent 60%),
-    #111018;
-}
-
-.graphHeader {
-  position: absolute;
-  top: 18px;
-  left: 22px;
-  z-index: 10;
-  pointer-events: none;
-}
-
-.graphHeaderTitle {
-  font-family: var(--font-mono);
-  font-size: 0.8rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #e5e7eb;
-  margin: 0;
-}
-
-.graphHeaderMeta {
-  font-size: 0.72rem;
-  color: var(--text-3);
-  margin-top: 4px;
-}
-
-.graphControls {
-  position: absolute;
-  top: 18px;
-  right: 22px;
-  z-index: 10;
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  /* No padding — the EvidenceGraph component owns its own internal layout */
+  padding: 0;
+  min-height: 540px;
+}
+
+/* The react-flow canvas wrapper fills all remaining panel height */
+.graphPanel > div {
+  flex: 1;
+  min-height: 0;
 }
 
 .graphControlBtn {
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   color: var(--text-2);
-  padding: 6px 12px;
-  border-radius: 8px;
-  font-size: 0.75rem;
+  padding: 5px 11px;
+  border-radius: 7px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
   cursor: pointer;
   transition: all 0.2s var(--ease);
+  white-space: nowrap;
 }
 
 .graphControlBtn:hover {
@@ -839,95 +819,6 @@ h1, h2, h3, h4 {
   background: rgba(232, 105, 63, 0.08);
 }
 
-.graphGuide {
-  position: absolute;
-  top: 78px;
-  left: 22px;
-  z-index: 10;
-  width: 220px;
-  background: rgba(20, 20, 26, 0.85);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
-  padding: 10px 12px;
-  backdrop-filter: blur(10px);
-  pointer-events: none;
-}
-
-.graphGuideTitle {
-  font-family: var(--font-mono);
-  font-size: 0.62rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-3);
-  margin-bottom: 6px;
-}
-
-.graphGuideRow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.72rem;
-  color: var(--text-2);
-  line-height: 1.3;
-  margin-top: 6px;
-}
-
-.graphGuideDot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: 0 0 auto;
-}
-
-.graphLegend {
-  position: absolute;
-  bottom: 22px;
-  left: 22px;
-  z-index: 10;
-  pointer-events: none;
-}
-
-.graphLegendTitle {
-  font-family: var(--font-mono);
-  font-size: 0.62rem;
-  font-weight: 600;
-  color: var(--text-3);
-  margin-bottom: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.graphLegendList {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.graphLegendItem {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.graphLegendDot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-}
-
-.graphLegendLabel {
-  font-size: 0.78rem;
-  color: #e5e7eb;
-}
-
-.graphLegendDesc {
-  font-size: 0.65rem;
-  color: var(--text-3);
-}
-
-.nodeShell {
-  backdrop-filter: blur(8px);
-}
 
 .nodeHeader {
   display: flex;
@@ -1418,24 +1309,142 @@ h1, h2, h3, h4 {
 .fEvLink:hover { opacity: 1; }
 
 /* ═══════════════════════════════════════════════
-   BOTTOM DOCK
+   BOTTOM DOCK — two-column (tabs | source status)
    ═══════════════════════════════════════════════ */
 .dock {
-  background: var(--surface-solid);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
+  /* Outer wrapper: just positions the two side-by-side columns */
+  display: grid;
+  /* tabs+content column mirrors the graph ~70%, source status mirrors findings ~30% */
+  grid-template-columns: 1fr minmax(260px, 360px);
+  gap: 14px;
   animation: fadeUp 0.5s var(--ease) 0.22s backwards;
-  display: flex;
-  flex-direction: column;
-  max-height: 400px;
+  min-height: 0;
+  max-height: 260px;
 }
 
+/* Left column: the tabbed debug panel */
 .dockTabs {
   display: flex;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  overflow-x: auto;
 }
+
+.dockLeft {
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Right column: source status */
+.dockRight {
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.dockRightTitle {
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.srcStatusList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.srcStatusRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--raised-solid);
+  border: 1px solid var(--border);
+  transition: border-color 0.2s;
+}
+
+.srcStatusRow:hover { border-color: var(--border-h); }
+
+.srcStatusIcon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: rgba(255,255,255,0.05);
+  display: grid;
+  place-items: center;
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+
+.srcStatusBody {
+  flex: 1;
+  min-width: 0;
+}
+
+.srcStatusName {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text);
+  display: block;
+}
+
+.srcStatusMeta {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-3);
+  margin-top: 1px;
+}
+
+.srcStatusBadge {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.srcStatusBadge.ok {
+  background: var(--green-s);
+  color: var(--green);
+  border: 1px solid rgba(52, 211, 153, 0.25);
+}
+
+.srcStatusBadge.fail {
+  background: var(--red-s);
+  color: var(--red);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+}
+
+.srcStatusBadge.off {
+  background: rgba(255,255,255,0.04);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+}
+
 
 .dTab {
   flex: 1;
@@ -1709,12 +1718,19 @@ h1, h2, h3, h4 {
 .skipRow span:last-child { color: var(--text-3); font-size: 0.75rem; }
 
 /* ═══ RESPONSIVE ═══ */
+@media (max-width: 1200px) {
+  .mainArea { grid-template-columns: 1fr minmax(280px, 320px); }
+  .dock { grid-template-columns: 1fr; max-height: none; }
+  .dockRight { max-height: 260px; }
+}
+
 @media (max-width: 1100px) {
   .mainArea { grid-template-columns: 1fr; }
   .feedPanel { max-height: 400px; }
   .topBar { flex-wrap: wrap; }
   .tbCenter { border: none; }
   .tbRight { border: none; }
+  .dock { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {
@@ -1727,10 +1743,248 @@ h1, h2, h3, h4 {
   .tbRight { border-left: none; border-top: 1px solid var(--border); justify-content: space-between; }
   .assessment { flex-direction: column; align-items: flex-start; }
   .riskScore { width: 70px; }
-  .graphCanvas { height: 420px; }
-  .graphGuide,
-  .graphLegend { display: none; }
   .tierNodes,
   .tierNodes.wide { grid-template-columns: 1fr 1fr; display: grid; }
-  .dock { max-height: 300px; }
+  .dock { max-height: none; }
+  .dockRight { max-height: 220px; }
+}
+
+/* ─── Evidence Graph: lightning-bolt edge animation ────────────────────────── */
+@keyframes flowBolt {
+  from { stroke-dashoffset: 200; }
+  to   { stroke-dashoffset: 0; }
+}
+.react-flow__edge path.bolt-aura {
+  animation: flowBolt 2s linear infinite;
+}
+.react-flow__edge path.bolt-core {
+  animation: flowBolt 2s linear infinite;
+}
+
+/* ─── Schema Panel ────────────────────────── */
+.schema-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  z-index: 999;
+}
+
+.schema-panel {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 450px;
+  max-width: 100vw;
+  background: #0e0d13;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: -10px 0 40px rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+}
+
+.schema-header {
+  padding: 20px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.schema-header h2 {
+  margin: 0;
+  font-size: 1.1rem;
+  color: #fff;
+  font-family: var(--font-mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.schema-close {
+  background: transparent;
+  border: none;
+  color: #a099b4;
+  font-size: 1.5rem;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.schema-close:hover {
+  color: #fff;
+}
+
+.schema-body {
+  padding: 24px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.schema-desc {
+  color: #a099b4;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  margin-top: 0;
+  margin-bottom: 24px;
+}
+
+.schema-loading {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 40px 0;
+}
+
+.schema-source-group {
+  margin-bottom: 24px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.schema-source-header {
+  padding: 12px 16px;
+  background: rgba(0, 0, 0, 0.2);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.schema-source-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.source-name {
+  color: #e6e4f0;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.badge {
+  font-size: 0.65rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+}
+
+.badge.success {
+  background: rgba(52, 211, 153, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+}
+
+.badge.error {
+  background: rgba(248, 113, 113, 0.15);
+  color: #f87171;
+  border: 1px solid rgba(248, 113, 113, 0.3);
+}
+
+.schema-tool-item {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+.schema-tool-item:last-child {
+  border-bottom: none;
+}
+
+.schema-tool-header {
+  padding: 12px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.schema-tool-header:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.tool-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool-name {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.tool-kind {
+  color: #a099b4;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+}
+
+.tool-toggle {
+  color: #a099b4;
+  font-family: var(--font-mono);
+  font-size: 1rem;
+}
+
+.schema-tool-details {
+  padding: 0 16px 16px;
+  overflow: hidden;
+}
+
+.tool-purpose {
+  color: #e6e4f0;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  margin: 8px 0 16px;
+}
+
+.tool-schema {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.schema-col-header, .schema-col-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 12px;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+}
+
+.schema-col-header {
+  background: rgba(255, 255, 255, 0.05);
+  color: #a099b4;
+  font-weight: 600;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.schema-col-row {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+.schema-col-row:last-child {
+  border-bottom: none;
+}
+
+.col-name {
+  color: #e6e4f0;
+}
+
+.col-req {
+  color: #f87171;
+  margin-left: 4px;
+}
+
+.col-type {
+  color: #60a5fa;
+}
+
+.schema-col-row.empty {
+  color: #a099b4;
+  justify-content: center;
+  font-style: italic;
 }
