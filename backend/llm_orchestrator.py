@@ -240,7 +240,7 @@ def plan_with_openrouter(
     payload = {
         "model": model,
         "temperature": 0.1,
-        "max_tokens": 4000,
+        "max_tokens": 7000,
         "messages": [
             {
                 "role": "system",
@@ -385,7 +385,7 @@ def extract_package_candidates_with_openrouter(
     payload = {
         "model": model,
         "temperature": 0.0,
-        "max_tokens": 4000,
+        "max_tokens": 10000,
         "messages": [
             {
                 "role": "system",
@@ -514,7 +514,7 @@ def build_dynamic_investigation_payload(
     return {
         "model": model,
         "temperature": 0.2,
-        "max_tokens": 4000,
+        "max_tokens": 10000,
         "tools": tools,
         "tool_choice": "auto",
         "tool_name_map": tool_name_map,

@@ -7,6 +7,13 @@ import time
 import uuid
 from pathlib import Path
 
+import queue
+import anyio
+import threading
+from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -19,7 +26,6 @@ from llm_orchestrator import (
     plan_with_openrouter,
     build_dynamic_investigation_payload,
     openrouter_chat_tools,
-    build_verdict_with_openrouter,
 )
 
 
@@ -37,6 +43,8 @@ def configure_logging() -> None:
 
 configure_logging()
 logger = logging.getLogger("harborguard.api")
+
+_active_progress_queue: queue.Queue | None = None
 
 app = FastAPI(
     title="HarborGuard",
@@ -817,6 +825,15 @@ def query_step_with_timeout(
         duration_ms,
         len(result.rows),
     )
+    if _active_progress_queue is not None and not name.startswith("metadata_"):
+        _active_progress_queue.put({
+            "type": "query",
+            "name": name,
+            "sql": sql,
+            "rows": len(result.rows),
+            "duration_ms": duration_ms,
+            "preview": result.rows[:2],
+        })
     return {
         "name": name,
         "ok": True,
@@ -2442,249 +2459,307 @@ def package_investigation(req: PackageInvestigationReq) -> dict[str, object]:
 
 @app.post("/agent/investigate")
 def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
-    started_at = time.perf_counter()
-    logger.info(
-        "endpoint.agent_investigate.start owner=%s repo=%s package=%s version=%s question=%s",
-        req.owner,
-        req.repo,
-        req.package_name,
-        req.package_version,
-        compact_text(req.question),
-    )
-    fixture = load_fixture("agent_investigate")
-    if fixture:
-        response = dict(fixture)
-        response["question"] = req.question
-        response["fixture_used"] = True
-        return response
-    owner = sql_string(req.owner)
-    repo = sql_string(req.repo)
-    org = sql_string(req.org or req.owner)
-    policy_query = sql_string(req.policy_query)
+    return agent_investigate_internal(req)
 
-    github_recent_pulls_sql = f"""
-    SELECT number, title, body, state, user__login, created_at, updated_at, merged_at, html_url, url
-    FROM github.pulls
-    WHERE owner = '{owner}'
-      AND repo = '{repo}'
-      AND state = 'all'
-      AND sort = 'updated'
-      AND direction = 'desc'
-    LIMIT 8
-    """
-    github_recent_commits_sql = f"""
-    SELECT sha, commit__message, commit__author__date, commit__committer__date, html_url
-    FROM github.commits
-    WHERE owner = '{owner}'
-      AND repo = '{repo}'
-    LIMIT 12
-    """
-    github_dependabot_alerts_sql = f"""
-    SELECT number, state, dependency__package__ecosystem, dependency__package__name,
-           security_advisory__severity, security_advisory__summary, html_url, created_at
-    FROM github.alerts
-    WHERE org = '{org}'
-      AND state = 'open'
-    LIMIT 20
-    """
-    github_secret_file_search_sql = f"""
-    SELECT name, path, html_url, repository_full_name
-    FROM github.search_code(q => 'repo:{owner}/{repo} filename:.env')
-    LIMIT 10
-    """
-    notion_policy_context_sql = f"""
-    SELECT id, object, url, public_url, raw
-    FROM notion.search
-    WHERE query = '{policy_query}'
-    LIMIT 5
-    """
 
-    capabilities = discover_capabilities()
-    metadata_steps = capabilities.get("metadata_steps", [])
-    plan = plan_with_orchestrator(req, capabilities)
-    selected_tools = set(plan["selected_tools"])
+@app.post("/agent/investigate/stream")
+def agent_investigate_stream(req: AgentInvestigationReq):
+    q: queue.Queue = queue.Queue()
 
-    steps: list[dict[str, object]] = []
+    def worker() -> None:
+        try:
+            result = agent_investigate_internal(req, progress_queue=q)
+            q.put({"type": "complete", "data": result})
+        except Exception as e:
+            logger.exception("agent_investigate_stream worker failed")
+            q.put({"type": "error", "error": str(e)})
 
-    # Phase 1: always discover repository context first. This is what lets the
-    # agent infer the package target from the repo instead of relying on defaults.
-    github_timeout = github_query_timeout()
-    if tool_available(capabilities, "github.pulls"):
-        github_pulls_step = query_step_with_timeout(
-            "github_recent_pulls",
-            github_recent_pulls_sql,
-            github_timeout,
-        )
-    else:
-        github_pulls_step = skipped_step(
-            "github_recent_pulls",
-            "github.pulls is not available in Coral metadata",
-        )
-    steps.append(github_pulls_step)
+    threading.Thread(target=worker, daemon=True).start()
 
-    if tool_available(capabilities, "github.commits"):
-        github_commits_step = query_step_with_timeout(
-            "github_recent_commits",
-            github_recent_commits_sql,
-            github_timeout,
-        )
-    else:
-        github_commits_step = skipped_step(
-            "github_recent_commits",
-            "github.commits is not available in Coral metadata",
-        )
-    steps.append(github_commits_step)
+    async def event_stream():
+        while True:
+            try:
+                item = await anyio.to_thread.run_sync(lambda: q.get(timeout=0.5))
+                yield f"data: {json.dumps(jsonable_encoder(item))}\n\n"
+                if item.get("type") in ("complete", "error"):
+                    break
+            except queue.Empty:
+                yield ": keepalive\n\n"
 
-    if github_alerts_enabled() and tool_available(capabilities, "github.alerts"):
-        github_alerts_step = query_step_with_timeout(
-            "github_dependabot_alerts",
-            github_dependabot_alerts_sql,
-            github_timeout,
-        )
-    else:
-        github_alerts_step = skipped_step(
-            "github_dependabot_alerts",
-            "GitHub Dependabot org alerts are disabled by default because the org endpoint often returns 404 without matching permissions",
-        )
-    steps.append(github_alerts_step)
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # Phase 2: extract target package/version from PRs and alerts.
-    manifest_candidates = []
+
+def agent_investigate_internal(
+    req: AgentInvestigationReq,
+    progress_queue: queue.Queue | None = None,
+) -> dict[str, object]:
+    global _active_progress_queue
+    _active_progress_queue = progress_queue
+
+    def emit(msg: str) -> None:
+        if progress_queue:
+            progress_queue.put({"type": "progress", "message": msg})
+
     try:
-        import urllib.request
-        url = f"https://raw.githubusercontent.com/{req.owner}/{req.repo}/main/package.json"
-        req_obj = urllib.request.Request(url)
-        with urllib.request.urlopen(req_obj, timeout=5) as response:
-            content = response.read().decode('utf-8')
-        manifest_candidates = extract_candidates_from_manifest(content, "npm", url)
-    except Exception as e:
-        logger.warning("Failed to fetch package.json for manifest pass: %s", e)
-
-    package_target, extraction = extract_package_target(
-        req,
-        github_pulls_step,
-        github_alerts_step,
-        github_commits_step,
-    )
-    steps.append(package_extraction_step(extraction))
-
-    all_candidates = manifest_candidates + extraction.get("candidates", [])
-    if package_target:
-        all_candidates.insert(0, package_target)
-    
-    deep_scan_targets = dedupe_candidates(all_candidates)[:5]
-
-    analysis_req = req
-    deep_scan_target = None
-    selected_package_text = "none"
-    
-    # Keep the first target as the primary analysis_req for backward compatibility
-    if deep_scan_targets:
-        primary = deep_scan_targets[0]
-        deep_scan_target = primary
-        if len(deep_scan_targets) == 1:
-            selected_package_text = f"{primary.get('package_name')}@{primary.get('version')}"
-        else:
-            selected_package_text = f"{len(deep_scan_targets)} vulnerable packages"
-            
-        analysis_req = req.model_copy(
-            update={
-                "package_name": primary.get("package_name"),
-                "package_version": primary.get("version"),
-                "package_system": primary.get("system"),
-                "package_ecosystem": primary.get("ecosystem"),
-            }
+        emit("Starting investigation...")
+        started_at = time.perf_counter()
+        logger.info(
+            "endpoint.agent_investigate.start owner=%s repo=%s package=%s version=%s question=%s",
+            req.owner,
+            req.repo,
+            req.package_name,
+            req.package_version,
+            compact_text(req.question),
         )
-    logger.info("agent.package_target.selected target=%s", selected_package_text)
+        fixture = load_fixture("agent_investigate")
+        if fixture:
+            response = dict(fixture)
+            response["question"] = req.question
+            response["fixture_used"] = True
+            return response
+        owner = sql_string(req.owner)
+        repo = sql_string(req.repo)
+        org = sql_string(req.org or req.owner)
+        policy_query = sql_string(req.policy_query)
 
-    # Phase 3: run deep package analysis for all targets.
-    scan_results: list[dict] = []
-    
-    for target in deep_scan_targets:
-        pkg = target.get("package_name", "unknown")
-        ver = target.get("version") or "unknown"
-        tag = f"{pkg}:{ver}"
-        
-        package_sql = build_package_sql(target)
-        bundle = {
-            "target": target,
-            "tag": tag,
-            "osv_step": None,
-            "deps_version_step": None,
-            "deps_deps_step": None,
-            "advisories_step": None,
-        }
-        
-        if package_sql.get("osv_version") and tool_available(capabilities, "osv.query_by_version"):
-            bundle["osv_step"] = query_step(f"osv_package_vulnerabilities:{tag}", package_sql["osv_version"])
-            steps.append(bundle["osv_step"])
-        
-        if package_sql.get("deps_version") and tool_available(capabilities, "deps_dev.versions"):
-            bundle["deps_version_step"] = query_step(f"deps_dev_package_version:{tag}", package_sql["deps_version"])
-            steps.append(bundle["deps_version_step"])
-            
-            deps_rows = first_rows(bundle["deps_version_step"], limit=1)
-            deps_version_row = deps_rows[0] if deps_rows else None
-            advisory_keys = advisory_keys_from_version(deps_version_row)
-            advisories_sql = deps_dev_advisories_sql(advisory_keys)
-            if advisories_sql:
-                bundle["advisories_step"] = query_step(f"deps_dev_advisories:{tag}", advisories_sql)
-                steps.append(bundle["advisories_step"])
-        
-        if package_sql.get("deps_dependencies") and tool_available(capabilities, "deps_dev.dependencies"):
-            bundle["deps_deps_step"] = query_step(f"deps_dev_dependencies:{tag}", package_sql["deps_dependencies"])
-            steps.append(bundle["deps_deps_step"])
-        
-        scan_results.append(bundle)
-        
-    if not scan_results:
-        reason = "no dependency package target was discovered from repository context"
-        steps.append(skipped_step("deps_dev_package_version", reason))
-        steps.append(skipped_step("deps_dev_dependencies", reason))
-        steps.append(skipped_step("osv_package_vulnerabilities", reason))
-
-    # Phase 4: run selected contextual enrichments around the repo/package.
-    if "github.search_code" in selected_tools and tool_available(capabilities, "github.search_code"):
-        steps.append(query_step("github_secret_file_search", github_secret_file_search_sql))
-    else:
-        skipped = next(
-            (
-                item
-                for item in plan["skipped_tools"]
-                if item["tool"] == "github.search_code"
-            ),
-            {"reason": "planner did not select this tool"},
-        )
-        steps.append(skipped_step("github_secret_file_search", skipped["reason"]))
-
-    if "notion.search" in selected_tools and tool_available(capabilities, "notion.search"):
-        steps.append(query_step("notion_policy_context", notion_policy_context_sql))
-    else:
-        skipped = next(
-            (
-                item
-                for item in plan["skipped_tools"]
-                if item["tool"] == "notion.search"
-            ),
-            {"reason": "planner did not select this tool"},
-        )
-        steps.append(skipped_step("notion_policy_context", skipped["reason"]))
-
-    if req.slack_channel:
-        slack_channel = sql_string(req.slack_channel)
-        package_search_term = sql_string(str(package_target.get("package_name") or "")) if package_target else ""
-        slack_security_discussion_sql = f"""
-        SELECT user_id, text, ts, thread_ts, reply_count
-        FROM slack.messages(channel => '{slack_channel}')
-        WHERE text ILIKE '%security%'
-           OR text ILIKE '%dependency%'
-           OR text ILIKE '%secret%'
-           OR text ILIKE '%access%'
-           {f"OR text ILIKE '%{package_search_term}%'" if package_search_term else ""}
+        github_recent_pulls_sql = f"""
+        SELECT number, title, body, state, user__login, created_at, updated_at, merged_at, html_url, url
+        FROM github.pulls
+        WHERE owner = '{owner}'
+          AND repo = '{repo}'
+          AND state = 'all'
+          AND sort = 'updated'
+          AND direction = 'desc'
+        LIMIT 8
+        """
+        github_recent_commits_sql = f"""
+        SELECT sha, commit__message, commit__author__date, commit__committer__date, html_url
+        FROM github.commits
+        WHERE owner = '{owner}'
+          AND repo = '{repo}'
+        LIMIT 12
+        """
+        github_dependabot_alerts_sql = f"""
+        SELECT number, state, dependency__package__ecosystem, dependency__package__name,
+               security_advisory__severity, security_advisory__summary, html_url, created_at
+        FROM github.alerts
+        WHERE org = '{org}'
+          AND state = 'open'
         LIMIT 20
         """
-        if "slack.messages" in selected_tools and tool_available(capabilities, "slack.messages"):
-            steps.append(query_step("slack_security_discussion", slack_security_discussion_sql))
+        github_secret_file_search_sql = f"""
+        SELECT name, path, html_url, repository_full_name
+        FROM github.search_code(q => 'repo:{owner}/{repo} filename:.env')
+        LIMIT 10
+        """
+        notion_policy_context_sql = f"""
+        SELECT id, object, url, public_url, raw
+        FROM notion.search
+        WHERE query = '{policy_query}'
+        LIMIT 5
+        """
+
+        emit("Discovering capabilities and connected sources...")
+        capabilities = discover_capabilities()
+        emit(f"Discovered {len(capabilities.get('tools', []))} available tools")
+        metadata_steps = capabilities.get("metadata_steps", [])
+        emit("Planning investigation...")
+        plan = plan_with_orchestrator(req, capabilities)
+        selected_tools = set(plan["selected_tools"])
+
+        steps: list[dict[str, object]] = []
+
+        # Phase 1: always discover repository context first. This is what lets the
+        # agent infer the package target from the repo instead of relying on defaults.
+        github_timeout = github_query_timeout()
+        if tool_available(capabilities, "github.pulls"):
+            github_pulls_step = query_step_with_timeout(
+                "github_recent_pulls",
+                github_recent_pulls_sql,
+                github_timeout,
+            )
+        else:
+            github_pulls_step = skipped_step(
+                "github_recent_pulls",
+                "github.pulls is not available in Coral metadata",
+            )
+        steps.append(github_pulls_step)
+
+        if tool_available(capabilities, "github.commits"):
+            github_commits_step = query_step_with_timeout(
+                "github_recent_commits",
+                github_recent_commits_sql,
+                github_timeout,
+            )
+        else:
+            github_commits_step = skipped_step(
+                "github_recent_commits",
+                "github.commits is not available in Coral metadata",
+            )
+        steps.append(github_commits_step)
+
+        if github_alerts_enabled() and tool_available(capabilities, "github.alerts"):
+            github_alerts_step = query_step_with_timeout(
+                "github_dependabot_alerts",
+                github_dependabot_alerts_sql,
+                github_timeout,
+            )
+        else:
+            github_alerts_step = skipped_step(
+                "github_dependabot_alerts",
+                "GitHub Dependabot org alerts are disabled by default because the org endpoint often returns 404 without matching permissions",
+            )
+        steps.append(github_alerts_step)
+
+        # Phase 2: extract target package/version from PRs and alerts.
+        emit("Extracting manifest and package candidates...")
+        manifest_candidates = []
+        try:
+            import urllib.request
+            url = f"https://raw.githubusercontent.com/{req.owner}/{req.repo}/main/package.json"
+            req_obj = urllib.request.Request(url)
+            with urllib.request.urlopen(req_obj, timeout=5) as response:
+                content = response.read().decode('utf-8')
+            manifest_candidates = extract_candidates_from_manifest(content, "npm", url)
+        except Exception as e:
+            logger.warning("Failed to fetch package.json for manifest pass: %s", e)
+
+        package_target, extraction = extract_package_target(
+            req,
+            github_pulls_step,
+            github_alerts_step,
+            github_commits_step,
+        )
+        steps.append(package_extraction_step(extraction))
+
+        all_candidates = manifest_candidates + extraction.get("candidates", [])
+        if package_target:
+            all_candidates.insert(0, package_target)
+    
+        deep_scan_targets = dedupe_candidates(all_candidates)[:5]
+
+        analysis_req = req
+        deep_scan_target = None
+        selected_package_text = "none"
+    
+        # Keep the first target as the primary analysis_req for backward compatibility
+        if deep_scan_targets:
+            primary = deep_scan_targets[0]
+            deep_scan_target = primary
+            if len(deep_scan_targets) == 1:
+                selected_package_text = f"{primary.get('package_name')}@{primary.get('version')}"
+            else:
+                selected_package_text = f"{len(deep_scan_targets)} vulnerable packages"
+            
+            analysis_req = req.model_copy(
+                update={
+                    "package_name": primary.get("package_name"),
+                    "package_version": primary.get("version"),
+                    "package_system": primary.get("system"),
+                    "package_ecosystem": primary.get("ecosystem"),
+                }
+            )
+        logger.info("agent.package_target.selected target=%s", selected_package_text)
+
+        # Phase 3: run deep package analysis for all targets.
+        scan_results: list[dict] = []
+    
+        emit(f"Deep scanning {len(deep_scan_targets)} package target(s)...")
+        for target in deep_scan_targets:
+            pkg = target.get("package_name", "unknown")
+            ver = target.get("version") or "unknown"
+            tag = f"{pkg}:{ver}"
+        
+            package_sql = build_package_sql(target)
+            bundle = {
+                "target": target,
+                "tag": tag,
+                "osv_step": None,
+                "deps_version_step": None,
+                "deps_deps_step": None,
+                "advisories_step": None,
+            }
+        
+            if package_sql.get("osv_version") and tool_available(capabilities, "osv.query_by_version"):
+                bundle["osv_step"] = query_step(f"osv_package_vulnerabilities:{tag}", package_sql["osv_version"])
+                steps.append(bundle["osv_step"])
+        
+            if package_sql.get("deps_version") and tool_available(capabilities, "deps_dev.versions"):
+                bundle["deps_version_step"] = query_step(f"deps_dev_package_version:{tag}", package_sql["deps_version"])
+                steps.append(bundle["deps_version_step"])
+            
+                deps_rows = first_rows(bundle["deps_version_step"], limit=1)
+                deps_version_row = deps_rows[0] if deps_rows else None
+                advisory_keys = advisory_keys_from_version(deps_version_row)
+                advisories_sql = deps_dev_advisories_sql(advisory_keys)
+                if advisories_sql:
+                    bundle["advisories_step"] = query_step(f"deps_dev_advisories:{tag}", advisories_sql)
+                    steps.append(bundle["advisories_step"])
+        
+            if package_sql.get("deps_dependencies") and tool_available(capabilities, "deps_dev.dependencies"):
+                bundle["deps_deps_step"] = query_step(f"deps_dev_dependencies:{tag}", package_sql["deps_dependencies"])
+                steps.append(bundle["deps_deps_step"])
+        
+            scan_results.append(bundle)
+        
+        if not scan_results:
+            reason = "no dependency package target was discovered from repository context"
+            steps.append(skipped_step("deps_dev_package_version", reason))
+            steps.append(skipped_step("deps_dev_dependencies", reason))
+            steps.append(skipped_step("osv_package_vulnerabilities", reason))
+
+        # Phase 4: run selected contextual enrichments around the repo/package.
+        if "github.search_code" in selected_tools and tool_available(capabilities, "github.search_code"):
+            steps.append(query_step("github_secret_file_search", github_secret_file_search_sql))
+        else:
+            skipped = next(
+                (
+                    item
+                    for item in plan["skipped_tools"]
+                    if item["tool"] == "github.search_code"
+                ),
+                {"reason": "planner did not select this tool"},
+            )
+            steps.append(skipped_step("github_secret_file_search", skipped["reason"]))
+
+        if "notion.search" in selected_tools and tool_available(capabilities, "notion.search"):
+            steps.append(query_step("notion_policy_context", notion_policy_context_sql))
+        else:
+            skipped = next(
+                (
+                    item
+                    for item in plan["skipped_tools"]
+                    if item["tool"] == "notion.search"
+                ),
+                {"reason": "planner did not select this tool"},
+            )
+            steps.append(skipped_step("notion_policy_context", skipped["reason"]))
+
+        if req.slack_channel:
+            slack_channel = sql_string(req.slack_channel)
+            package_search_term = sql_string(str(package_target.get("package_name") or "")) if package_target else ""
+            slack_security_discussion_sql = f"""
+            SELECT user_id, text, ts, thread_ts, reply_count
+            FROM slack.messages(channel => '{slack_channel}')
+            WHERE text ILIKE '%security%'
+               OR text ILIKE '%dependency%'
+               OR text ILIKE '%secret%'
+               OR text ILIKE '%access%'
+               {f"OR text ILIKE '%{package_search_term}%'" if package_search_term else ""}
+            LIMIT 20
+            """
+            if "slack.messages" in selected_tools and tool_available(capabilities, "slack.messages"):
+                steps.append(query_step("slack_security_discussion", slack_security_discussion_sql))
+            else:
+                skipped = next(
+                    (
+                        item
+                        for item in plan["skipped_tools"]
+                        if item["tool"] == "slack.messages"
+                    ),
+                    {"reason": "planner did not select this tool"},
+                )
+                steps.append(skipped_step("slack_security_discussion", skipped["reason"]))
         else:
             skipped = next(
                 (
@@ -2692,261 +2767,255 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
                     for item in plan["skipped_tools"]
                     if item["tool"] == "slack.messages"
                 ),
-                {"reason": "planner did not select this tool"},
+                {"reason": "slack_channel was not provided"},
             )
             steps.append(skipped_step("slack_security_discussion", skipped["reason"]))
-    else:
-        skipped = next(
-            (
-                item
-                for item in plan["skipped_tools"]
-                if item["tool"] == "slack.messages"
-            ),
-            {"reason": "slack_channel was not provided"},
-        )
-        steps.append(skipped_step("slack_security_discussion", skipped["reason"]))
 
-    # Phase 5: Dynamic LLM Tool Calls (Multi-Turn)
-    import json
-    payload = build_dynamic_investigation_payload(req, capabilities, deep_scan_targets)
-    if payload:
-        turn = 0
-        while turn < 3:
-            turn += 1
-            started_at_t = time.perf_counter()
-            try:
-                tool_calls, raw_message = openrouter_chat_tools(payload, started_at_t, f"llm.dynamic_turn_{turn}")
-            except Exception as e:
-                logger.warning("llm.dynamic_turn.error turn=%s error=%s", turn, e)
-                break
+        # Phase 5: Dynamic LLM Tool Calls (Multi-Turn)
+        import json
+        emit("Starting dynamic investigation loop...")
+        payload = build_dynamic_investigation_payload(req, capabilities, deep_scan_targets)
+        if payload:
+            turn = 0
+            while turn < 3:
+                turn += 1
+                started_at_t = time.perf_counter()
+                try:
+                    tool_calls, raw_message = openrouter_chat_tools(payload, started_at_t, f"llm.dynamic_turn_{turn}")
+                except Exception as e:
+                    logger.warning("llm.dynamic_turn.error turn=%s error=%s", turn, e)
+                    break
                 
-            if not tool_calls:
-                break
+                if not tool_calls:
+                    break
                 
-            payload["messages"].append(raw_message)
+                payload["messages"].append(raw_message)
             
-            for i, call in enumerate(tool_calls, start=1):
-                tool_name = call.get("function", {}).get("name")
-                call_id = call.get("id")
-                if not tool_name:
-                    continue
+                for i, call in enumerate(tool_calls, start=1):
+                    tool_name = call.get("function", {}).get("name")
+                    call_id = call.get("id")
+                    if not tool_name:
+                        continue
                     
-                args_str = call.get("function", {}).get("arguments", "{}")
-                try:
-                    args = json.loads(args_str)
-                except Exception:
-                    args = {}
+                    args_str = call.get("function", {}).get("arguments", "{}")
+                    try:
+                        args = json.loads(args_str)
+                    except Exception:
+                        args = {}
                     
-                tool_name_map = payload.get("tool_name_map", {})
-                original_name = tool_name_map.get(tool_name, tool_name.replace("_", ".", 1))
-                tool_info = capabilities.get("tools", {}).get(original_name, {})
-                kind = tool_info.get("kind", "table")
+                    tool_name_map = payload.get("tool_name_map", {})
+                    original_name = tool_name_map.get(tool_name, tool_name.replace("_", ".", 1))
+                    tool_info = capabilities.get("tools", {}).get(original_name, {})
+                    kind = tool_info.get("kind", "table")
                 
-                if kind in ("function", "table_function"):
-                    args_list = []
-                    for k, v in args.items():
-                        args_list.append(f"{k} => '{sql_string(str(v))}'")
-                    args_str_sql = ", ".join(args_list)
-                    sql = f"SELECT * FROM {original_name}({args_str_sql}) LIMIT 10"
-                else:
-                    filters = []
-                    for k, v in args.items():
-                        filters.append(f"{k} = '{sql_string(str(v))}'")
-                    where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
-                    sql = f"SELECT * FROM {original_name}{where_clause} LIMIT 10"
-
-                purpose = f"Dynamic query for {original_name}"
-                step_name = f"dynamic_tool_{turn}_{i}"
-                try:
-                    started_at_q = time.perf_counter()
-                    
-                    if original_name == "github.file":
-                        owner = args.get("owner", req.owner)
-                        repo = args.get("repo", req.repo)
-                        path = args.get("path", "package.json")
-                        import urllib.request
-                        url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
-                        logger.info("agent.dynamic_tool.start name=%s url=%s", step_name, url)
-                        req_obj = urllib.request.Request(url)
-                        with urllib.request.urlopen(req_obj, timeout=10) as response:
-                            content = response.read().decode('utf-8')
-                        candidates = extract_candidates_from_manifest(content, "npm", url)
-                        result_rows = [{"content": content, "candidates": candidates}]
-                        sql_executed = "bypass: github raw API"
-                        duration_ms = elapsed_ms(started_at_q)
+                    if kind in ("function", "table_function"):
+                        args_list = []
+                        for k, v in args.items():
+                            args_list.append(f"{k} => '{sql_string(str(v))}'")
+                        args_str_sql = ", ".join(args_list)
+                        sql = f"SELECT * FROM {original_name}({args_str_sql}) LIMIT 10"
                     else:
-                        logger.info("agent.dynamic_tool.start name=%s sql=%s", step_name, compact_sql(sql))
-                        result = coral.query(sql)
-                        result_rows = result.rows
-                        sql_executed = sql
-                        duration_ms = elapsed_ms(started_at_q)
-                        
-                    steps.append({
-                        "name": step_name,
-                        "ok": True,
-                        "rows": result_rows,
-                        "sql": sql_executed,
-                        "purpose": purpose,
-                        "error": None,
-                        "duration_ms": duration_ms,
-                        "is_dynamic": True,
-                    })
-                    payload["messages"].append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": json.dumps(result_rows[:10])
-                    })
-                    logger.info("agent.dynamic_tool.ok name=%s duration_ms=%s rows=%s", step_name, duration_ms, len(result_rows))
-                except Exception as error:
-                    logger.warning("agent.dynamic_tool.error name=%s error=%s", step_name, error)
-                    steps.append({
-                        "name": step_name,
-                        "ok": False,
-                        "rows": [],
-                        "sql": sql,
-                        "purpose": purpose,
-                        "error": str(error),
-                        "duration_ms": elapsed_ms(started_at_q),
-                        "is_dynamic": True,
-                    })
-                    payload["messages"].append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": json.dumps({"error": str(error)})
-                    })
+                        filters = []
+                        for k, v in args.items():
+                            filters.append(f"{k} = '{sql_string(str(v))}'")
+                        where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
+                        sql = f"SELECT * FROM {original_name}{where_clause} LIMIT 10"
 
-    # Phase 5b: If dynamic loop found package data but Phase 3 was skipped,
-    # extract candidates from dynamic results and re-run deep scan
-    if not scan_results:
-        dynamic_candidates = []
-        for step in steps:
-            if not step.get("is_dynamic") or not step.get("rows"):
-                continue
-            rows = step.get("rows", [])
-            for row in rows:
-                # Detect deps_dev version rows
-                if row.get("package_name") and row.get("version") and row.get("advisory_keys") is not None:
-                    candidate = normalize_package_candidate({
-                        "package_name": row["package_name"],
-                        "version": row["version"],
-                        "system": row.get("system") or row.get("requested_system"),
-                        "ecosystem": infer_osv_ecosystem(row.get("system"), None),
-                        "confidence": 0.90,
-                        "source": "dynamic.deps_dev",
-                        "reason": f"Dynamic investigation found {row['package_name']}@{row['version']}",
-                    })
-                    if candidate:
-                        dynamic_candidates.append(candidate)
-        
-        if dynamic_candidates:
-            dynamic_candidates = dedupe_candidates(dynamic_candidates)
-            for dynamic_target in dynamic_candidates[:5]:
-                if dynamic_target and dynamic_target.get("version") and dynamic_target.get("system"):
-                    if not scan_results:
-                        # Set primary request info from first target
-                        analysis_req = req.model_copy(update={
-                            "package_name": dynamic_target["package_name"],
-                            "package_version": dynamic_target["version"],
-                            "package_system": dynamic_target["system"],
-                            "package_ecosystem": dynamic_target["ecosystem"],
-                        })
+                    purpose = f"Dynamic query for {original_name}"
+                    step_name = f"dynamic_tool_{turn}_{i}"
+                    try:
+                        started_at_q = time.perf_counter()
                     
-                    pkg = dynamic_target.get("package_name", "unknown")
-                    ver = dynamic_target.get("version", "unknown")
-                    tag = f"{pkg}:{ver}"
-                    
-                    package_sql = build_package_sql(dynamic_target)
-                    bundle = {
-                        "target": dynamic_target,
-                        "tag": tag,
-                        "osv_step": None,
-                        "deps_version_step": None,
-                        "deps_deps_step": None,
-                        "advisories_step": None,
-                    }
-                    
-                    if package_sql.get("osv_version") and tool_available(capabilities, "osv.query_by_version"):
-                        bundle["osv_step"] = query_step(f"osv_package_vulnerabilities:{tag}", package_sql["osv_version"])
-                        steps.append(bundle["osv_step"])
-                    
-                    # We already have deps_dev row from the dynamic loop
-                    deps_row = next(
-                        (row for s in steps if s.get("is_dynamic")
-                         for row in s.get("rows", [])
-                         if row.get("package_name") == dynamic_target["package_name"]),
-                        None
-                    )
-                    if deps_row:
-                        bundle["deps_version_step"] = {
-                            "name": f"deps_dev_package_version:{tag}",
+                        if original_name == "github.file":
+                            owner = args.get("owner", req.owner)
+                            repo = args.get("repo", req.repo)
+                            path = args.get("path", "package.json")
+                            import urllib.request
+                            url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
+                            logger.info("agent.dynamic_tool.start name=%s url=%s", step_name, url)
+                            req_obj = urllib.request.Request(url)
+                            with urllib.request.urlopen(req_obj, timeout=10) as response:
+                                content = response.read().decode('utf-8')
+                            candidates = extract_candidates_from_manifest(content, "npm", url)
+                            result_rows = [{"content": content, "candidates": candidates}]
+                            sql_executed = "bypass: github raw API"
+                            duration_ms = elapsed_ms(started_at_q)
+                        else:
+                            logger.info("agent.dynamic_tool.start name=%s sql=%s", step_name, compact_sql(sql))
+                            result = coral.query(sql)
+                            result_rows = result.rows
+                            sql_executed = sql
+                            duration_ms = elapsed_ms(started_at_q)
+                        
+                        steps.append({
+                            "name": step_name,
                             "ok": True,
-                            "rows": [deps_row],
-                            "is_dynamic": True
+                            "rows": result_rows,
+                            "sql": sql_executed,
+                            "purpose": purpose,
+                            "error": None,
+                            "duration_ms": duration_ms,
+                            "is_dynamic": True,
+                        })
+                        payload["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps(result_rows[:10])
+                        })
+                        logger.info("agent.dynamic_tool.ok name=%s duration_ms=%s rows=%s", step_name, duration_ms, len(result_rows))
+                    except Exception as error:
+                        logger.warning("agent.dynamic_tool.error name=%s error=%s", step_name, error)
+                        steps.append({
+                            "name": step_name,
+                            "ok": False,
+                            "rows": [],
+                            "sql": sql,
+                            "purpose": purpose,
+                            "error": str(error),
+                            "duration_ms": elapsed_ms(started_at_q),
+                            "is_dynamic": True,
+                        })
+                        payload["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps({"error": str(error)})
+                        })
+
+        # Phase 5b: If dynamic loop found package data but Phase 3 was skipped,
+        # extract candidates from dynamic results and re-run deep scan
+        if not scan_results:
+            dynamic_candidates = []
+            for step in steps:
+                if not step.get("is_dynamic") or not step.get("rows"):
+                    continue
+                rows = step.get("rows", [])
+                for row in rows:
+                    # Detect deps_dev version rows
+                    if row.get("package_name") and row.get("version") and row.get("advisory_keys") is not None:
+                        candidate = normalize_package_candidate({
+                            "package_name": row["package_name"],
+                            "version": row["version"],
+                            "system": row.get("system") or row.get("requested_system"),
+                            "ecosystem": infer_osv_ecosystem(row.get("system"), None),
+                            "confidence": 0.90,
+                            "source": "dynamic.deps_dev",
+                            "reason": f"Dynamic investigation found {row['package_name']}@{row['version']}",
+                        })
+                        if candidate:
+                            dynamic_candidates.append(candidate)
+        
+            if dynamic_candidates:
+                dynamic_candidates = dedupe_candidates(dynamic_candidates)
+                for dynamic_target in dynamic_candidates[:5]:
+                    if dynamic_target and dynamic_target.get("version") and dynamic_target.get("system"):
+                        if not scan_results:
+                            # Set primary request info from first target
+                            analysis_req = req.model_copy(update={
+                                "package_name": dynamic_target["package_name"],
+                                "package_version": dynamic_target["version"],
+                                "package_system": dynamic_target["system"],
+                                "package_ecosystem": dynamic_target["ecosystem"],
+                            })
+                    
+                        pkg = dynamic_target.get("package_name", "unknown")
+                        ver = dynamic_target.get("version", "unknown")
+                        tag = f"{pkg}:{ver}"
+                    
+                        package_sql = build_package_sql(dynamic_target)
+                        bundle = {
+                            "target": dynamic_target,
+                            "tag": tag,
+                            "osv_step": None,
+                            "deps_version_step": None,
+                            "deps_deps_step": None,
+                            "advisories_step": None,
                         }
+                    
+                        if package_sql.get("osv_version") and tool_available(capabilities, "osv.query_by_version"):
+                            bundle["osv_step"] = query_step(f"osv_package_vulnerabilities:{tag}", package_sql["osv_version"])
+                            steps.append(bundle["osv_step"])
+                    
+                        # We already have deps_dev row from the dynamic loop
+                        deps_row = next(
+                            (row for s in steps if s.get("is_dynamic")
+                             for row in s.get("rows", [])
+                             if row.get("package_name") == dynamic_target["package_name"]),
+                            None
+                        )
+                        if deps_row:
+                            bundle["deps_version_step"] = {
+                                "name": f"deps_dev_package_version:{tag}",
+                                "ok": True,
+                                "rows": [deps_row],
+                                "is_dynamic": True
+                            }
                         
-                    advisory_keys = advisory_keys_from_version(deps_row)
-                    advisories_sql = deps_dev_advisories_sql(advisory_keys)
-                    if advisories_sql and tool_available(capabilities, "deps_dev.advisories"):
-                        bundle["advisories_step"] = query_step(f"deps_dev_advisories:{tag}", advisories_sql)
-                        steps.append(bundle["advisories_step"])
+                        advisory_keys = advisory_keys_from_version(deps_row)
+                        advisories_sql = deps_dev_advisories_sql(advisory_keys)
+                        if advisories_sql and tool_available(capabilities, "deps_dev.advisories"):
+                            bundle["advisories_step"] = query_step(f"deps_dev_advisories:{tag}", advisories_sql)
+                            steps.append(bundle["advisories_step"])
                         
-                    scan_results.append(bundle)
+                        scan_results.append(bundle)
 
-    findings = build_agent_findings(analysis_req, steps, scan_results)
-    review_signals = build_review_signals(analysis_req, steps)
-    evidence_graph = build_evidence_graph(analysis_req, findings)
-    max_score = max([int(finding["score"]) for finding in findings], default=0)
-    risk_level = level_from_score(max_score)
-    failed_steps = [step for step in steps if not step.get("ok")]
-    total_duration_ms = elapsed_ms(started_at)
-    debug_timeline = build_debug_timeline(
-        metadata_steps,
-        plan,
-        steps,
-        total_duration_ms,
-    )
-    reasoning_trace = [
-        *plan["reasoning_trace"],
-        "Repository context discovery ran before dependency scanning.",
-        *[str(item) for item in extraction.get("trace", [])],
-        f"Executed {len([step for step in steps if not step.get('skipped')])} selected investigation step(s).",
-        f"Generated {len(findings)} confirmed finding(s) and {len(review_signals)} review signal(s).",
-    ]
-    logger.info(
-        "endpoint.agent_investigate.done duration_ms=%s risk=%s score=%s findings=%s failed_steps=%s",
-        total_duration_ms,
-        risk_level,
-        max_score,
-        len(findings),
-        len(failed_steps),
-    )
-
-    return {
-        "question": req.question,
-        "answer": build_assessment_answer(
+        emit("Synthesizing findings...")
+        findings = build_agent_findings(analysis_req, steps, scan_results)
+        review_signals = build_review_signals(analysis_req, steps)
+        evidence_graph = build_evidence_graph(analysis_req, findings)
+        max_score = max([int(finding["score"]) for finding in findings], default=0)
+        risk_level = level_from_score(max_score)
+        failed_steps = [step for step in steps if not step.get("ok")]
+        total_duration_ms = elapsed_ms(started_at)
+        debug_timeline = build_debug_timeline(
+            metadata_steps,
+            plan,
+            steps,
+            total_duration_ms,
+        )
+        reasoning_trace = [
+            *plan["reasoning_trace"],
+            "Repository context discovery ran before dependency scanning.",
+            *[str(item) for item in extraction.get("trace", [])],
+            f"Executed {len([step for step in steps if not step.get('skipped')])} selected investigation step(s).",
+            f"Generated {len(findings)} confirmed finding(s) and {len(review_signals)} review signal(s).",
+        ]
+        logger.info(
+            "endpoint.agent_investigate.done duration_ms=%s risk=%s score=%s findings=%s failed_steps=%s",
+            total_duration_ms,
+            risk_level,
+            max_score,
             len(findings),
-            len(review_signals),
-            selected_package_text,
-        ),
-        "target_package": deep_scan_target,
-        "package_candidate": package_target,
-        "package_extraction": extraction,
-        "risk_level": risk_level,
-        "score": max_score,
-        "findings": findings,
-        "review_signals": review_signals,
-        "evidence_graph": evidence_graph,
-        "reasoning_trace": reasoning_trace,
-        "planner": plan,
-        "capability_summary": capabilities["summary"],
-        "steps": steps,
-        "metadata_steps": metadata_steps,
-        "debug_timeline": debug_timeline,
-        "source_status": {
-            "ok": len(failed_steps) == 0,
-            "failed_steps": [
-                {"name": step["name"], "error": step.get("error")}
-                for step in failed_steps
-            ],
-        },
-    }
+            len(failed_steps),
+        )
+
+        return {
+            "question": req.question,
+            "answer": build_assessment_answer(
+                len(findings),
+                len(review_signals),
+                selected_package_text,
+            ),
+            "target_package": deep_scan_target,
+            "package_candidate": package_target,
+            "package_extraction": extraction,
+            "risk_level": risk_level,
+            "score": max_score,
+            "findings": findings,
+            "review_signals": review_signals,
+            "evidence_graph": evidence_graph,
+            "reasoning_trace": reasoning_trace,
+            "planner": plan,
+            "capability_summary": capabilities["summary"],
+            "steps": steps,
+            "metadata_steps": metadata_steps,
+            "debug_timeline": debug_timeline,
+            "source_status": {
+                "ok": len(failed_steps) == 0,
+                "failed_steps": [
+                    {"name": step["name"], "error": step.get("error")}
+                    for step in failed_steps
+                ],
+            },
+        }
+    finally:
+        _active_progress_queue = None
