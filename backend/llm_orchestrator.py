@@ -460,6 +460,7 @@ def compact_text(text: str, limit: int = 320) -> str:
 def build_dynamic_investigation_payload(
     req: Any,
     capabilities: dict[str, Any],
+    deep_scan_targets: list[dict] | None = None,
 ) -> dict[str, Any] | None:
     if not llm_planner_enabled():
         return None
@@ -469,6 +470,7 @@ def build_dynamic_investigation_payload(
         return None
 
     tools = []
+    tool_name_map: dict[str, str] = {}
     
     if "tools" in capabilities:
         for t_name, t_info in capabilities["tools"].items():
@@ -476,6 +478,7 @@ def build_dynamic_investigation_payload(
                 continue
                 
             safe_name = t_name.replace(".", "_")
+            tool_name_map[safe_name] = t_name
             properties = {}
             required = []
             
@@ -484,6 +487,12 @@ def build_dynamic_investigation_payload(
                 properties[col_name] = {"type": "string", "description": f"Filter by {col_name}"}
                 if f.get("is_required"):
                     required.append(col_name)
+
+            for a in t_info.get("arguments", []):
+                arg_name = str(a.get("name"))
+                properties[arg_name] = {"type": "string", "description": f"Argument: {arg_name}"}
+                if a.get("required", True):
+                    required.append(arg_name)
                     
             tools.append({
                 "type": "function",
@@ -508,17 +517,18 @@ def build_dynamic_investigation_payload(
         "max_tokens": 4000,
         "tools": tools,
         "tool_choice": "auto",
+        "tool_name_map": tool_name_map,
         "messages": [
             {
                 "role": "system",
                 "content": (
                     "You are HarborGuard's dynamic autonomous investigation agent. "
-                    "Your goal is to autonomously determine the project stack, read the appropriate manifest files (like package.json, pom.xml, go.mod), "
-                    "and cross-reference the discovered dependencies with deps_dev and osv.\n"
-                    "Workflow:\n"
-                    "1. Call github_search_code to find package manifests and determine the stack.\n"
-                    "2. Once you see the file paths, if they belong to supported ecosystems (npm, pypi, go, maven, cargo, nuget), "
-                    "call deps_dev_versions and osv_query_by_version on the relevant packages.\n"
+                    "Your goal is to investigate context around known vulnerable packages.\n"
+                    "We have already scanned the manifest and discovered vulnerabilities for the packages listed in 'already_scanned_packages'.\n"
+                    "Your new objective is to use contextual enrichment tools (like github.search_code, notion.search, slack.messages) "
+                    "to find evidence of whether these vulnerable packages are actually imported/called in production code, "
+                    "if there are internal discussions about them, or if recent PRs attempted remediation.\n"
+                    "Do NOT query deps_dev or osv for packages that are already scanned.\n"
                     "You will receive the output of your tool calls. Make up to 3 turns of tool calls to complete the investigation.\n"
                     "CRITICAL RULE: When investigating, always restrict your searches, commits, and pull requests to the default branch (e.g. 'main' or 'master') only."
                 ),
@@ -529,9 +539,93 @@ def build_dynamic_investigation_payload(
                     {
                         "task": "Investigate the target repository and its dependencies autonomously.",
                         "request": _request_context(req),
+                        "already_scanned_packages": [
+                            {"package": t.get("package_name"), "version": t.get("version")}
+                            for t in (deep_scan_targets or [])
+                        ],
+                        "remaining_investigation_goals": [
+                            "Check if any of these packages are in production code paths",
+                            "Find any Slack or Notion discussion about these vulnerabilities",
+                            "Check if any recent PRs attempted remediation",
+                        ]
                     },
                     indent=2,
                 ),
             },
         ],
+    }
+
+def build_verdict_with_openrouter(
+    req: Any,
+    findings: list[dict[str, Any]],
+    review_signals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not llm_planner_enabled():
+        return {
+            "verdict": "monitor",
+            "confidence": 0.5,
+            "headline": "Verdict layer disabled.",
+            "because": ["LLM planner is disabled"],
+            "next_action": None,
+        }
+
+    model = os.getenv("OPENROUTER_MODEL")
+    if not model:
+        return {
+            "verdict": "monitor",
+            "confidence": 0.5,
+            "headline": "Verdict layer disabled.",
+            "because": ["OPENROUTER_MODEL is not set"],
+            "next_action": None,
+        }
+
+    started_at = time.perf_counter()
+    logger.info("llm.verdict.start model=%s", model)
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a Senior Security Engineer reviewing automated scanner outputs. "
+                    "Your job is to look at mechanically generated findings and determine the actual "
+                    "severity and next step. A finding earns escalation if there is strong evidence "
+                    "(e.g., a CVE exists AND it was introduced in a recent merge, OR no policy approval was found). "
+                    "A finding does NOT earn escalation if the only evidence is a low-severity file match "
+                    "with no CVE or policy violation. "
+                    "Return only JSON matching the requested schema."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "task": "Issue a final verdict on this security investigation.",
+                        "request": _request_context(req),
+                        "findings": findings,
+                        "review_signals": review_signals,
+                        "output_schema": {
+                            "verdict": "escalate | monitor | close",
+                            "confidence": 0.95,
+                            "headline": "One sentence. Why this matters or doesn't.",
+                            "because": ["specific reason 1", "specific reason 2"],
+                            "next_action": "Specific thing a human should do, or null",
+                        },
+                    },
+                    indent=2,
+                ),
+            },
+        ],
+    }
+
+    verdict_data = openrouter_chat_json(payload, started_at, "llm.verdict")
+    
+    return {
+        "verdict": verdict_data.get("verdict", "monitor"),
+        "confidence": verdict_data.get("confidence", 0.5),
+        "headline": verdict_data.get("headline", "Investigation complete."),
+        "because": verdict_data.get("because", []),
+        "next_action": verdict_data.get("next_action"),
     }

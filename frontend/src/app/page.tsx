@@ -33,7 +33,9 @@ type Planner = {
 type GraphNode = { id: string; type: string; label: string; severity?: string; score?: number; source?: string; url?: string | null };
 type GraphEdge = { from: string; to: string; type: string };
 type EvidenceGraphData = { nodes?: GraphNode[]; edges?: GraphEdge[] };
+type Verdict = { verdict: "escalate" | "monitor" | "close"; confidence: number; headline: string; because: string[]; next_action: string | null };
 type InvestigationResponse = {
+  verdict?: Verdict;
   answer?: string; risk_level?: string; score?: number; findings?: Finding[];
   review_signals?: Finding[];
   planner?: Planner; reasoning_trace?: string[]; evidence_graph?: EvidenceGraphData;
@@ -225,8 +227,37 @@ export default function Home() {
         {/* ─── Assessment ─── */}
         <section className="assessment">
           <div className="aBody">
-            <span className="aLabel">Assessment</span>
-            <h2 className="aAnswer">{result.answer}</h2>
+            {result.verdict ? (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+                  <span style={{ 
+                    padding: "2px 8px", borderRadius: "4px", fontSize: "0.75rem", fontWeight: 700, letterSpacing: "0.05em",
+                    background: result.verdict.verdict === "escalate" ? "rgba(239,68,68,0.2)" : result.verdict.verdict === "monitor" ? "rgba(245,158,11,0.2)" : "rgba(16,185,129,0.2)",
+                    color: result.verdict.verdict === "escalate" ? "#fca5a5" : result.verdict.verdict === "monitor" ? "#fcd34d" : "#6ee7b7",
+                    border: `1px solid ${result.verdict.verdict === "escalate" ? "rgba(239,68,68,0.4)" : result.verdict.verdict === "monitor" ? "rgba(245,158,11,0.4)" : "rgba(16,185,129,0.4)"}`
+                  }}>
+                    {result.verdict.verdict.toUpperCase()}
+                  </span>
+                  <span className="aLabel" style={{ margin: 0 }}>Final Verdict</span>
+                </div>
+                <h2 className="aAnswer" style={{ color: "#fff", fontSize: "1.1rem", lineHeight: 1.4 }}>{result.verdict.headline}</h2>
+                {result.verdict.because && result.verdict.because.length > 0 && (
+                  <ul style={{ margin: "12px 0 16px 0", paddingLeft: "20px", color: "#a1a1aa", fontSize: "0.9rem", lineHeight: 1.5, display: "flex", flexDirection: "column", gap: "6px" }}>
+                    {result.verdict.because.map((r, i) => <li key={i}>{r}</li>)}
+                  </ul>
+                )}
+                {result.verdict.next_action && (
+                  <div style={{ marginTop: "12px", padding: "12px", background: "rgba(255,255,255,0.03)", borderRadius: "6px", borderLeft: "3px solid #6366f1", fontSize: "0.9rem", color: "#e2e8f0" }}>
+                    <strong style={{ color: "#818cf8", marginRight: "6px" }}>Next Action:</strong> {result.verdict.next_action}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <span className="aLabel">Assessment</span>
+                <h2 className="aAnswer">{result.answer}</h2>
+              </>
+            )}
             {result.target_package && (
               <div className="targetPill">
                 <span>Target</span>
@@ -332,9 +363,25 @@ export default function Home() {
               {activeTab === "sql" && (
                 <div className="execList">
                   {steps.filter(s => s.sql).map(s => (
-                    <div key={s.name} style={{ marginBottom: 10 }}>
+                    <div key={s.name} style={{ marginBottom: 16 }}>
                       <span className="execDetailLabel">{s.name}</span>
-                      <pre className="execPre">{s.sql}</pre>
+                      <pre className="execPre" style={{ marginBottom: "6px" }}>{s.sql}</pre>
+                      {s.rows && s.rows.length > 0 && (
+                        <details style={{ background: "rgba(0,0,0,0.2)", borderRadius: "4px" }}>
+                          <summary style={{ padding: "6px 10px", fontSize: "0.75rem", color: "#a1a1aa", cursor: "pointer" }}>
+                            View Results ({s.rows.length} rows)
+                          </summary>
+                          <pre className="execPre" style={{ margin: 0, padding: "10px", maxHeight: "300px", overflow: "auto", fontSize: "0.7rem", color: "#e2e8f0" }}>
+                            {JSON.stringify(s.rows, null, 2)}
+                          </pre>
+                        </details>
+                      )}
+                      {(!s.rows || s.rows.length === 0) && !s.error && (
+                        <div style={{ fontSize: "0.75rem", color: "#64748b", padding: "4px 0" }}>0 rows returned</div>
+                      )}
+                      {s.error && (
+                        <div style={{ fontSize: "0.75rem", color: "#ef4444", padding: "4px 0" }}>Error: {s.error}</div>
+                      )}
                     </div>
                   ))}
                   {steps.filter(s => s.sql).length === 0 && <p className="dockEmpty">No SQL queries recorded.</p>}

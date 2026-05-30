@@ -19,6 +19,7 @@ from llm_orchestrator import (
     plan_with_openrouter,
     build_dynamic_investigation_payload,
     openrouter_chat_tools,
+    build_verdict_with_openrouter,
 )
 
 
@@ -69,7 +70,7 @@ def github_alerts_enabled() -> bool:
 
 
 def github_query_timeout() -> float:
-    return float(os.getenv("HARBORGUARD_GITHUB_QUERY_TIMEOUT_SECONDS", "10"))
+    return float(os.getenv("HARBORGUARD_GITHUB_QUERY_TIMEOUT_SECONDS", "20"))
 
 
 def load_fixture(name: str) -> dict[str, object] | None:
@@ -140,7 +141,7 @@ class AgentInvestigationReq(BaseModel):
     repo: str
     org: str | None = None
     slack_channel: str | None = None
-    policy_query: str = "dependency security review secrets access control"
+    policy_query: str | None = "dependency security review secrets access control"
     package_system: str | None = None
     package_ecosystem: str | None = None
     package_name: str | None = None
@@ -178,6 +179,13 @@ INVESTIGATION_TOOLS = {
         "purpose": "Search repository code for likely secret-bearing files.",
         "capabilities": ["secret_file_search"],
         "step": "github_secret_file_search",
+    },
+    "github.file": {
+        "source": "github",
+        "kind": "table_function",
+        "purpose": "Fetch raw file content from a repository path.",
+        "capabilities": ["manifest_reading"],
+        "step": "github_file_content",
     },
     "deps_dev.versions": {
         "source": "deps_dev",
@@ -231,15 +239,14 @@ def sql_string(value: str) -> str:
 def deps_dev_advisories_sql(advisory_keys: list[str]) -> str | None:
     if not advisory_keys:
         return None
-    normalized = [sql_string(key) for key in advisory_keys if key]
-    if not normalized:
-        return None
-    key_list = ", ".join(f"'{key}'" for key in normalized[:5])
+    # Coral requires individual equality filters, not IN clause
+    # Query the highest-priority key only - CVSS enrichment for top advisory
+    key = sql_string(advisory_keys[0])
     return f"""
     SELECT advisory_id, title, advisory_url, cvss3_score, aliases
     FROM deps_dev.advisories
-    WHERE advisory_id IN ({key_list})
-    LIMIT 20
+    WHERE advisory_id = '{key}'
+    LIMIT 1
     """
 
 
@@ -598,6 +605,40 @@ def dedupe_candidates(candidates: list[dict[str, object]]) -> list[dict[str, obj
     )
 
 
+def extract_candidates_from_manifest(
+    file_content: str,
+    ecosystem: str,
+    source_url: str,
+) -> list[dict]:
+    """Parse package.json dependencies into package candidates."""
+    try:
+        manifest = json.loads(file_content)
+    except json.JSONDecodeError:
+        return []
+    
+    candidates = []
+    for dep_section in ("dependencies", "devDependencies"):
+        for pkg_name, version_spec in manifest.get(dep_section, {}).items():
+            # Strip ^ ~ >= etc to get the base version
+            version = version_spec.lstrip("^~>=<").split(" ")[0]
+            if not is_plausible_dependency_version(version):
+                continue
+            
+            candidate = normalize_package_candidate({
+                "package_name": pkg_name,
+                "version": version,
+                "ecosystem": ecosystem,
+                "system": "NPM",
+                "confidence": 0.95,
+                "source": "github.file",
+                "reason": "Found in package.json dependencies.",
+                "evidence": {"url": source_url},
+            })
+            if candidate:
+                candidates.append(candidate)
+    return candidates
+
+
 def extract_package_target(
     req: AgentInvestigationReq,
     pull_step: dict[str, object],
@@ -830,7 +871,16 @@ def recommendation_from_score(score: int) -> str:
 
 def normalize_advisory_keys(value: object) -> list[str]:
     if isinstance(value, list):
-        return [str(item) for item in value if item]
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                # Handle {"id": "GHSA-..."} format from deps_dev
+                key = item.get("id") or item.get("key") or item.get("advisory_id")
+                if key:
+                    result.append(str(key))
+            elif item:
+                result.append(str(item))
+        return result
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -844,7 +894,7 @@ def normalize_advisory_keys(value: object) -> list[str]:
                 parsed = None
 
         if isinstance(parsed, list):
-            return [str(item) for item in parsed if item]
+            return normalize_advisory_keys(parsed)
         if isinstance(parsed, str):
             return [parsed]
         if "," in text:
@@ -882,6 +932,33 @@ def version_deprecated(version_row: dict | None) -> bool:
     return False
 
 
+def max_cvss_from_osv(osv_rows: list[dict]) -> float:
+    max_score = 0.0
+    for row in osv_rows:
+        severity_list = row.get("severity") or []
+        if isinstance(severity_list, str):
+            try:
+                severity_list = json.loads(severity_list)
+            except Exception:
+                continue
+        for entry in severity_list:
+            score_str = str(entry.get("score") or "")
+            # CVSS:3.1/AV:N/AC:H/... → extract base score from vector
+            # or if it's a numeric score directly
+            try:
+                numeric = float(score_str)
+                max_score = max(max_score, numeric)
+            except ValueError:
+                # It's a vector string like "CVSS:3.1/AV:N/..."
+                # Parse base score from vector - last component before /
+                # Simple heuristic: AV:N + AC:L = high, AC:H = lower
+                if "AV:N" in score_str and "AC:L" in score_str:
+                    max_score = max(max_score, 8.0)
+                elif "AV:N" in score_str:
+                    max_score = max(max_score, 6.5)
+    return max_score
+
+
 def package_risk_assessment(
     osv_rows: list[dict],
     deps_version: dict | None,
@@ -893,7 +970,18 @@ def package_risk_assessment(
     reasons: list[str] = []
 
     if osv_rows:
-        score += 50
+        cvss = max_cvss_from_osv(osv_rows)
+        if cvss >= 9.0:
+            score += 85
+        elif cvss >= 7.0:
+            score += 70
+        elif cvss >= 4.0:
+            score += 50
+        else:
+            score += 35
+        # Also boost for volume of CVEs
+        if len(osv_rows) >= 5:
+            score += 10
         reasons.append("osv_vulnerability")
 
     if advisory_rows_have_cvss(advisory_rows):
@@ -930,6 +1018,7 @@ def package_risk_assessment(
         else "No vulnerability evidence found for this package version."
     )
 
+    score = min(score, 100)
     return {
         "score": score,
         "severity": package_level_from_score(score),
@@ -1016,10 +1105,12 @@ def step_by_name(
     steps: list[dict[str, object]],
     name: str,
 ) -> dict[str, object] | None:
+    # Return last match so Phase 5b results override Phase 3 placeholders
+    result = None
     for step in steps:
         if step.get("name") == name:
-            return step
-    return None
+            result = step
+    return result
 
 
 def skipped_step(name: str, reason: str) -> dict[str, object]:
@@ -1325,6 +1416,17 @@ def build_capabilities(metadata_steps: list[dict[str, object]]) -> dict[str, obj
             ],
         }
 
+        args_json = "[]"
+        if definition["kind"] == "table_function":
+            for row in table_functions:
+                if f"{row.get('schema_name')}.{row.get('function_name')}" == tool_name:
+                    args_json = str(row.get("arguments_json") or "[]")
+                    break
+        try:
+            tools[tool_name]["arguments"] = json.loads(args_json)
+        except Exception:
+            tools[tool_name]["arguments"] = []
+
     sources = {}
     for source in REQUIRED_SOURCES:
         source_inputs = [row for row in inputs if row.get("schema_name") == source]
@@ -1579,11 +1681,12 @@ def plan_with_orchestrator(
 def build_agent_findings(
     req: AgentInvestigationReq,
     steps: list[dict[str, object]],
+    scan_results: list[dict] | None = None,
 ) -> list[dict[str, object]]:
     by_name = {str(step["name"]): step for step in steps}
     findings: list[dict[str, object]] = []
 
-    alerts = first_rows(by_name["github_dependabot_alerts"], limit=10)
+    alerts = first_rows(by_name.get("github_dependabot_alerts", {}), limit=10)
     for alert in alerts:
         package = alert.get("dependency__package__name") or "unknown package"
         severity = str(alert.get("security_advisory__severity") or "medium")
@@ -1605,71 +1708,101 @@ def build_agent_findings(
             }
         )
 
-    osv_vulns = first_rows(by_name.get("osv_package_vulnerabilities", {}), limit=10)
-    deps_versions = first_rows(by_name.get("deps_dev_package_version", {}), limit=1)
-    deps_version = deps_versions[0] if deps_versions else None
-    deps_dependencies = first_rows(by_name.get("deps_dev_dependencies", {}), limit=10)
-    deps_advisories = first_rows(by_name.get("deps_dev_advisories", {}), limit=10)
-    advisory_keys = advisory_keys_from_version(deps_version)
+    targets_to_scan = scan_results or []
 
-    package_risk = package_risk_assessment(
-        osv_vulns,
-        deps_version,
-        deps_advisories,
-        deps_dependencies,
-        advisory_keys,
-    )
-    evidence = build_package_evidence(
-        osv_vulns,
-        deps_version,
-        deps_advisories,
-        deps_dependencies,
-        advisory_keys,
-    )
-
-    if evidence and package_risk["score"] >= 10:
-        findings.append(
-            {
+    for bundle in targets_to_scan:
+        target = bundle["target"]
+        pkg_name = target.get("package_name", "unknown")
+        pkg_version = target.get("version", "unknown")
+        
+        osv_rows = first_rows(bundle.get("osv_step") or {}, limit=20)
+        deps_version_rows = first_rows(bundle.get("deps_version_step") or {}, limit=1)
+        deps_version = deps_version_rows[0] if deps_version_rows else None
+        advisory_rows = first_rows(bundle.get("advisories_step") or {}, limit=10)
+        dependency_rows = first_rows(bundle.get("deps_deps_step") or {}, limit=10)
+        advisory_keys = advisory_keys_from_version(deps_version)
+        
+        risk = package_risk_assessment(osv_rows, deps_version, advisory_rows, dependency_rows, advisory_keys)
+        evidence = build_package_evidence(osv_rows, deps_version, advisory_rows, dependency_rows, advisory_keys)
+        
+        if evidence and risk["score"] >= 10:
+            findings.append({
                 "type": "vulnerable_dependency",
-                "title": f"{req.package_name}@{req.package_version} has vulnerability evidence",
-                "severity": package_risk["severity"],
-                "score": package_risk["score"],
+                "title": f"{pkg_name}@{pkg_version} has vulnerability evidence",
+                "severity": risk["severity"],
+                "score": risk["score"],
                 "evidence": evidence,
-                "recommendation": package_risk["recommendation"],
-            }
-        )
+                "recommendation": risk["recommendation"],
+            })
 
-    secret_hits = first_rows(by_name["github_secret_file_search"], limit=10)
+    secret_hits = first_rows(by_name.get("github_secret_file_search", {}), limit=10)
     if secret_hits:
-        findings.append(
-            {
-                "type": "possible_secret_exposure",
-                "title": "Repository contains files that may expose secrets",
-                "severity": "high",
-                "score": 70,
-                "evidence": [
-                    {
-                        "source": "github.search_code",
-                        "text": f"{row.get('path') or row.get('name')}",
-                        "url": row.get("html_url"),
-                    }
-                    for row in secret_hits[:5]
-                ],
-                "recommendation": "Review matched files and rotate exposed credentials if needed.",
-            }
-        )
+        low_tier = (".env.example", ".env.sample", ".env.template", ".env.local", ".env.dev")
+        high_hits = []
+        low_hits = []
+        
+        for row in secret_hits:
+            path = str(row.get("path") or row.get("name") or "").lower()
+            if any(path.endswith(l) for l in low_tier):
+                low_hits.append(row)
+            else:
+                high_hits.append(row)
 
-    policy_rows = first_rows(by_name["notion_policy_context"], limit=3)
-    slack_rows = first_rows(by_name["slack_security_discussion"], limit=3)
+        if high_hits:
+            findings.append(
+                {
+                    "type": "possible_secret_exposure",
+                    "title": "Repository contains files that may expose secrets",
+                    "severity": "high",
+                    "score": 70,
+                    "evidence": [
+                        {
+                            "source": "github.search_code",
+                            "text": f"{row.get('path') or row.get('name')}",
+                            "url": row.get("html_url"),
+                        }
+                        for row in high_hits[:5]
+                    ],
+                    "recommendation": "Review matched files and rotate exposed credentials if needed.",
+                }
+            )
+        if low_hits:
+            findings.append(
+                {
+                    "type": "possible_secret_exposure",
+                    "title": "Example/Template secret files found",
+                    "severity": "low",
+                    "score": 10,
+                    "evidence": [
+                        {
+                            "source": "github.search_code",
+                            "text": f"{row.get('path') or row.get('name')}",
+                            "url": row.get("html_url"),
+                        }
+                        for row in low_hits[:5]
+                    ],
+                    "recommendation": "Ensure no actual credentials are hardcoded in template files.",
+                }
+            )
+
+    raw_policy_rows = first_rows(by_name.get("notion_policy_context", {}), limit=3)
+    policy_rows = []
+    for row in raw_policy_rows:
+        text_to_check = f"{row.get('title', '')} {row.get('url', '')}".lower()
+        if any(term in text_to_check for term in ("security", "policy", "vulnerability")):
+            policy_rows.append(row)
+            
+    slack_rows = first_rows(by_name.get("slack_security_discussion", {}), limit=3)
     for finding in findings:
-        finding["policy_context"] = [
-            {
-                "source": "notion.search",
-                "text": row.get("url") or row.get("id"),
-                "url": row.get("url"),
-            }
-            for row in policy_rows
-        ]
+        if policy_rows:
+            finding["policy_context"] = [
+                {
+                    "source": "notion.search",
+                    "text": row.get("title") or row.get("url") or row.get("id"),
+                    "url": row.get("url"),
+                }
+                for row in policy_rows
+            ]
         finding["discussion_context"] = [
             {
                 "source": "slack.messages",
@@ -1743,7 +1876,7 @@ def build_review_signals(
 ) -> list[dict[str, object]]:
     by_name = {str(step["name"]): step for step in steps}
     pull_rows = first_rows(by_name.get("github_recent_pulls", {}), limit=20)
-    include_dependency_words = bool(req.package_name and req.package_version)
+    include_dependency_words = True
 
     matched_pulls = []
     for row in pull_rows:
@@ -1808,52 +1941,7 @@ def build_review_signals(
             }
         )
 
-    for step in steps:
-        if step.get("is_dynamic") and step.get("ok") and step.get("rows"):
-            rows = step.get("rows")
-            if not isinstance(rows, list) or not rows:
-                continue
-                
-            def format_row(r):
-                parts = []
-                for k, v in r.items():
-                    if v is None or k in ("url", "html_url"):
-                        continue
-                    val_str = str(v)
-                    if val_str.startswith("{"):
-                        try:
-                            import json
-                            parsed = json.loads(val_str)
-                            if isinstance(parsed, dict):
-                                if "login" in parsed:
-                                    val_str = parsed["login"]
-                                elif "name" in parsed:
-                                    val_str = parsed["name"]
-                                else:
-                                    val_str = "{...}"
-                        except Exception:
-                            pass
-                    if len(val_str) > 50:
-                        val_str = val_str[:47] + "..."
-                    parts.append(f"{k}: {val_str}")
-                txt = " | ".join(parts)
-                return txt[:200] + "..." if len(txt) > 200 else txt
-                
-            signals.append({
-                "type": "dynamic_investigation",
-                "title": f"Dynamic Query: {step.get('purpose', 'Ad-hoc investigation')}",
-                "severity": "informational",
-                "score": 15,
-                "evidence": [
-                    {
-                        "source": "llm.dynamic_sql",
-                        "text": format_row(row),
-                        "url": row.get("html_url") or row.get("url") or None,
-                    }
-                    for row in rows[:5]
-                ],
-                "recommendation": "Review these LLM-generated dynamic SQL query results for anomalies."
-            })
+
 
     return signals
 
@@ -2461,6 +2549,17 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
     steps.append(github_alerts_step)
 
     # Phase 2: extract target package/version from PRs and alerts.
+    manifest_candidates = []
+    try:
+        import urllib.request
+        url = f"https://raw.githubusercontent.com/{req.owner}/{req.repo}/main/package.json"
+        req_obj = urllib.request.Request(url)
+        with urllib.request.urlopen(req_obj, timeout=5) as response:
+            content = response.read().decode('utf-8')
+        manifest_candidates = extract_candidates_from_manifest(content, "npm", url)
+    except Exception as e:
+        logger.warning("Failed to fetch package.json for manifest pass: %s", e)
+
     package_target, extraction = extract_package_target(
         req,
         github_pulls_step,
@@ -2469,94 +2568,80 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
     )
     steps.append(package_extraction_step(extraction))
 
-    deep_scan_target = (
-        package_target
-        if package_target
-        and package_target.get("package_name")
-        and package_target.get("version")
-        and package_target.get("system")
-        else None
-    )
+    all_candidates = manifest_candidates + extraction.get("candidates", [])
+    if package_target:
+        all_candidates.insert(0, package_target)
+    
+    deep_scan_targets = dedupe_candidates(all_candidates)[:5]
 
     analysis_req = req
-    if deep_scan_target:
+    deep_scan_target = None
+    selected_package_text = "none"
+    
+    # Keep the first target as the primary analysis_req for backward compatibility
+    if deep_scan_targets:
+        primary = deep_scan_targets[0]
+        deep_scan_target = primary
+        if len(deep_scan_targets) == 1:
+            selected_package_text = f"{primary.get('package_name')}@{primary.get('version')}"
+        else:
+            selected_package_text = f"{len(deep_scan_targets)} vulnerable packages"
+            
         analysis_req = req.model_copy(
             update={
-                "package_name": deep_scan_target.get("package_name"),
-                "package_version": deep_scan_target.get("version"),
-                "package_system": deep_scan_target.get("system"),
-                "package_ecosystem": deep_scan_target.get("ecosystem"),
+                "package_name": primary.get("package_name"),
+                "package_version": primary.get("version"),
+                "package_system": primary.get("system"),
+                "package_ecosystem": primary.get("ecosystem"),
             }
         )
-    selected_package_text = (
-        f"{deep_scan_target.get('package_name')}@{deep_scan_target.get('version')}"
-        if deep_scan_target
-        else "none"
-    )
     logger.info("agent.package_target.selected target=%s", selected_package_text)
 
-    # Phase 3: run deep package analysis only after a real target is known.
-    if deep_scan_target:
-        package_sql = build_package_sql(deep_scan_target)
-        if package_sql["deps_version"] and tool_available(capabilities, "deps_dev.versions"):
-            steps.append(query_step("deps_dev_package_version", package_sql["deps_version"]))
-        else:
-            steps.append(
-                skipped_step(
-                    "deps_dev_package_version",
-                    "package target did not include enough deps.dev version inputs or tool is unavailable",
-                )
-            )
-
-        if package_sql["deps_dependencies"] and tool_available(capabilities, "deps_dev.dependencies"):
-            steps.append(query_step("deps_dev_dependencies", package_sql["deps_dependencies"]))
-        else:
-            steps.append(
-                skipped_step(
-                    "deps_dev_dependencies",
-                    "package target did not include enough deps.dev dependency inputs or tool is unavailable",
-                )
-            )
-
-        if package_sql["osv_version"] and tool_available(capabilities, "osv.query_by_version"):
-            steps.append(query_step("osv_package_vulnerabilities", package_sql["osv_version"]))
-        else:
-            steps.append(
-                skipped_step(
-                    "osv_package_vulnerabilities",
-                    "OSV exact version lookup skipped because package, ecosystem, or version was missing",
-                )
-            )
-    else:
-        reason = (
-            "dependency package was discovered but no exact version was found"
-            if package_target
-            else "no dependency package target was discovered from repository context"
-        )
+    # Phase 3: run deep package analysis for all targets.
+    scan_results: list[dict] = []
+    
+    for target in deep_scan_targets:
+        pkg = target.get("package_name", "unknown")
+        ver = target.get("version") or "unknown"
+        tag = f"{pkg}:{ver}"
+        
+        package_sql = build_package_sql(target)
+        bundle = {
+            "target": target,
+            "tag": tag,
+            "osv_step": None,
+            "deps_version_step": None,
+            "deps_deps_step": None,
+            "advisories_step": None,
+        }
+        
+        if package_sql.get("osv_version") and tool_available(capabilities, "osv.query_by_version"):
+            bundle["osv_step"] = query_step(f"osv_package_vulnerabilities:{tag}", package_sql["osv_version"])
+            steps.append(bundle["osv_step"])
+        
+        if package_sql.get("deps_version") and tool_available(capabilities, "deps_dev.versions"):
+            bundle["deps_version_step"] = query_step(f"deps_dev_package_version:{tag}", package_sql["deps_version"])
+            steps.append(bundle["deps_version_step"])
+            
+            deps_rows = first_rows(bundle["deps_version_step"], limit=1)
+            deps_version_row = deps_rows[0] if deps_rows else None
+            advisory_keys = advisory_keys_from_version(deps_version_row)
+            advisories_sql = deps_dev_advisories_sql(advisory_keys)
+            if advisories_sql:
+                bundle["advisories_step"] = query_step(f"deps_dev_advisories:{tag}", advisories_sql)
+                steps.append(bundle["advisories_step"])
+        
+        if package_sql.get("deps_dependencies") and tool_available(capabilities, "deps_dev.dependencies"):
+            bundle["deps_deps_step"] = query_step(f"deps_dev_dependencies:{tag}", package_sql["deps_dependencies"])
+            steps.append(bundle["deps_deps_step"])
+        
+        scan_results.append(bundle)
+        
+    if not scan_results:
+        reason = "no dependency package target was discovered from repository context"
         steps.append(skipped_step("deps_dev_package_version", reason))
         steps.append(skipped_step("deps_dev_dependencies", reason))
         steps.append(skipped_step("osv_package_vulnerabilities", reason))
-
-    deps_version_step = step_by_name(steps, "deps_dev_package_version")
-    deps_version_rows = first_rows(deps_version_step or {}, limit=1)
-    deps_version = deps_version_rows[0] if deps_version_rows else None
-    advisory_keys = advisory_keys_from_version(deps_version)
-    advisories_sql = deps_dev_advisories_sql(advisory_keys)
-    if deep_scan_target and tool_available(capabilities, "deps_dev.advisories"):
-        if advisories_sql:
-            advisories_step = query_step("deps_dev_advisories", advisories_sql)
-        else:
-            advisories_step = skipped_step(
-                "deps_dev_advisories",
-                "deps.dev version metadata did not include advisory keys",
-            )
-    else:
-        advisories_step = skipped_step(
-            "deps_dev_advisories",
-            "no exact package target was available for advisory expansion",
-        )
-
-    steps.append(advisories_step)
 
     # Phase 4: run selected contextual enrichments around the repo/package.
     if "github.search_code" in selected_tools and tool_available(capabilities, "github.search_code"):
@@ -2623,7 +2708,7 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
 
     # Phase 5: Dynamic LLM Tool Calls (Multi-Turn)
     import json
-    payload = build_dynamic_investigation_payload(req, capabilities)
+    payload = build_dynamic_investigation_payload(req, capabilities, deep_scan_targets)
     if payload:
         turn = 0
         while turn < 3:
@@ -2652,7 +2737,8 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
                 except Exception:
                     args = {}
                     
-                original_name = tool_name.replace("_", ".", 1)
+                tool_name_map = payload.get("tool_name_map", {})
+                original_name = tool_name_map.get(tool_name, tool_name.replace("_", ".", 1))
                 tool_info = capabilities.get("tools", {}).get(original_name, {})
                 kind = tool_info.get("kind", "table")
                 
@@ -2673,14 +2759,33 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
                 step_name = f"dynamic_tool_{turn}_{i}"
                 try:
                     started_at_q = time.perf_counter()
-                    logger.info("agent.dynamic_tool.start name=%s sql=%s", step_name, compact_sql(sql))
-                    result = coral.query(sql)
-                    duration_ms = elapsed_ms(started_at_q)
+                    
+                    if original_name == "github.file":
+                        owner = args.get("owner", req.owner)
+                        repo = args.get("repo", req.repo)
+                        path = args.get("path", "package.json")
+                        import urllib.request
+                        url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
+                        logger.info("agent.dynamic_tool.start name=%s url=%s", step_name, url)
+                        req_obj = urllib.request.Request(url)
+                        with urllib.request.urlopen(req_obj, timeout=10) as response:
+                            content = response.read().decode('utf-8')
+                        candidates = extract_candidates_from_manifest(content, "npm", url)
+                        result_rows = [{"content": content, "candidates": candidates}]
+                        sql_executed = "bypass: github raw API"
+                        duration_ms = elapsed_ms(started_at_q)
+                    else:
+                        logger.info("agent.dynamic_tool.start name=%s sql=%s", step_name, compact_sql(sql))
+                        result = coral.query(sql)
+                        result_rows = result.rows
+                        sql_executed = sql
+                        duration_ms = elapsed_ms(started_at_q)
+                        
                     steps.append({
                         "name": step_name,
                         "ok": True,
-                        "rows": result.rows,
-                        "sql": sql,
+                        "rows": result_rows,
+                        "sql": sql_executed,
                         "purpose": purpose,
                         "error": None,
                         "duration_ms": duration_ms,
@@ -2689,9 +2794,9 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
                     payload["messages"].append({
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": json.dumps(result.rows[:10])
+                        "content": json.dumps(result_rows[:10])
                     })
-                    logger.info("agent.dynamic_tool.ok name=%s duration_ms=%s rows=%s", step_name, duration_ms, len(result.rows))
+                    logger.info("agent.dynamic_tool.ok name=%s duration_ms=%s rows=%s", step_name, duration_ms, len(result_rows))
                 except Exception as error:
                     logger.warning("agent.dynamic_tool.error name=%s error=%s", step_name, error)
                     steps.append({
@@ -2710,7 +2815,84 @@ def agent_investigate(req: AgentInvestigationReq) -> dict[str, object]:
                         "content": json.dumps({"error": str(error)})
                     })
 
-    findings = build_agent_findings(analysis_req, steps)
+    # Phase 5b: If dynamic loop found package data but Phase 3 was skipped,
+    # extract candidates from dynamic results and re-run deep scan
+    if not scan_results:
+        dynamic_candidates = []
+        for step in steps:
+            if not step.get("is_dynamic") or not step.get("rows"):
+                continue
+            rows = step.get("rows", [])
+            for row in rows:
+                # Detect deps_dev version rows
+                if row.get("package_name") and row.get("version") and row.get("advisory_keys") is not None:
+                    candidate = normalize_package_candidate({
+                        "package_name": row["package_name"],
+                        "version": row["version"],
+                        "system": row.get("system") or row.get("requested_system"),
+                        "ecosystem": infer_osv_ecosystem(row.get("system"), None),
+                        "confidence": 0.90,
+                        "source": "dynamic.deps_dev",
+                        "reason": f"Dynamic investigation found {row['package_name']}@{row['version']}",
+                    })
+                    if candidate:
+                        dynamic_candidates.append(candidate)
+        
+        if dynamic_candidates:
+            dynamic_candidates = dedupe_candidates(dynamic_candidates)
+            for dynamic_target in dynamic_candidates[:5]:
+                if dynamic_target and dynamic_target.get("version") and dynamic_target.get("system"):
+                    if not scan_results:
+                        # Set primary request info from first target
+                        analysis_req = req.model_copy(update={
+                            "package_name": dynamic_target["package_name"],
+                            "package_version": dynamic_target["version"],
+                            "package_system": dynamic_target["system"],
+                            "package_ecosystem": dynamic_target["ecosystem"],
+                        })
+                    
+                    pkg = dynamic_target.get("package_name", "unknown")
+                    ver = dynamic_target.get("version", "unknown")
+                    tag = f"{pkg}:{ver}"
+                    
+                    package_sql = build_package_sql(dynamic_target)
+                    bundle = {
+                        "target": dynamic_target,
+                        "tag": tag,
+                        "osv_step": None,
+                        "deps_version_step": None,
+                        "deps_deps_step": None,
+                        "advisories_step": None,
+                    }
+                    
+                    if package_sql.get("osv_version") and tool_available(capabilities, "osv.query_by_version"):
+                        bundle["osv_step"] = query_step(f"osv_package_vulnerabilities:{tag}", package_sql["osv_version"])
+                        steps.append(bundle["osv_step"])
+                    
+                    # We already have deps_dev row from the dynamic loop
+                    deps_row = next(
+                        (row for s in steps if s.get("is_dynamic")
+                         for row in s.get("rows", [])
+                         if row.get("package_name") == dynamic_target["package_name"]),
+                        None
+                    )
+                    if deps_row:
+                        bundle["deps_version_step"] = {
+                            "name": f"deps_dev_package_version:{tag}",
+                            "ok": True,
+                            "rows": [deps_row],
+                            "is_dynamic": True
+                        }
+                        
+                    advisory_keys = advisory_keys_from_version(deps_row)
+                    advisories_sql = deps_dev_advisories_sql(advisory_keys)
+                    if advisories_sql and tool_available(capabilities, "deps_dev.advisories"):
+                        bundle["advisories_step"] = query_step(f"deps_dev_advisories:{tag}", advisories_sql)
+                        steps.append(bundle["advisories_step"])
+                        
+                    scan_results.append(bundle)
+
+    findings = build_agent_findings(analysis_req, steps, scan_results)
     review_signals = build_review_signals(analysis_req, steps)
     evidence_graph = build_evidence_graph(analysis_req, findings)
     max_score = max([int(finding["score"]) for finding in findings], default=0)
