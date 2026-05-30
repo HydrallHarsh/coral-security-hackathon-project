@@ -120,7 +120,7 @@ function cleanNodeLabel(label: string): string {
 
 // ─── Dagre layout ────────────────────────────────────────────────────────────
 const NODE_W = 290;
-const NODE_H = 200;
+const NODE_H = 168;
 
 function mapToReactFlowData(
   nodes: GraphNode[],
@@ -132,8 +132,8 @@ function mapToReactFlowData(
 
   const isHorizontal = mode !== 'hub' && mode !== 'cluster';
   const rankdir  = isHorizontal ? 'LR' : 'TB';
-  const ranksep  = isHorizontal ? 220 : 180;
-  const nodesep  = isHorizontal ? 100 : 120;
+  const ranksep  = isHorizontal ? 220 : mode === 'hub' ? 140 : 150;
+  const nodesep  = isHorizontal ? 100 : mode === 'hub' ? 130 : 90;
   const layout   = rankdir as 'LR' | 'TB';
 
   dagreGraph.setGraph({ rankdir, ranksep, nodesep });
@@ -172,15 +172,27 @@ function mapToReactFlowData(
     };
   });
 
+  const outgoingCount = new Map<string, number>();
+  for (const e of edges) {
+    outgoingCount.set(e.from, (outgoingCount.get(e.from) ?? 0) + 1);
+  }
+  const outgoingIndex = new Map<string, number>();
+
   const rfEdges: Edge[] = edges.map((e, i) => {
     dagreGraph.setEdge(e.from, e.to);
+    const totalFromSource = outgoingCount.get(e.from) ?? 1;
+    const idx = outgoingIndex.get(e.from) ?? 0;
+    outgoingIndex.set(e.from, idx + 1);
+    const pathOffset =
+      totalFromSource <= 1 ? 0 : (idx - (totalFromSource - 1) / 2) * 24;
+
     return {
       id:     `e-${e.from}-${e.to}-${i}`,
       source: e.from,
       target: e.to,
       type:   'animated',
-      label:  mapEdgeLabel(e.type),
-      data:   { kind: e.type },
+      label:  totalFromSource > 4 ? undefined : mapEdgeLabel(e.type),
+      data:   { kind: e.type, pathOffset },
     };
   });
 

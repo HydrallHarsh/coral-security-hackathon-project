@@ -1,13 +1,21 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
-import { motion } from "motion/react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { motion, AnimatePresence } from "motion/react";
 import { useRouter } from "next/navigation";
+import {
+  DEMO_REPO,
+  KONAMI_CODE,
+  KONAMI_MESSAGE,
+  TAGLINE_ROTATION,
+  TITLE_EASTER_EGG_MESSAGES,
+  detectMode,
+  pickRandom,
+} from "./utils/flavor";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 type SourceCapabilities = { available?: boolean; configured?: boolean; tools?: string[] };
-type ToolCapability = { available?: boolean; purpose?: string; source?: string; capabilities?: string[] };
 type CapabilitiesResponse = {
   capabilities?: {
     sources?: Record<string, SourceCapabilities>;
@@ -39,6 +47,12 @@ export default function Home() {
   const [form, setForm] = useState<InvestigationForm>(initialForm);
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tagline, setTagline] = useState(TAGLINE_ROTATION[0]);
+  const [titleClicks, setTitleClicks] = useState(0);
+  const [easterEgg, setEasterEgg] = useState<string | null>(null);
+  const [konamiIdx, setKonamiIdx] = useState(0);
+
+  const activeMode = detectMode(form.question);
 
   async function refreshCapabilities() {
     try {
@@ -52,17 +66,60 @@ export default function Home() {
 
   useEffect(() => { void refreshCapabilities(); }, []);
 
+  useEffect(() => {
+    const id = setInterval(() => setTagline(pickRandom(TAGLINE_ROTATION)), 6000);
+    return () => clearInterval(id);
+  }, []);
+
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (e.code === KONAMI_CODE[konamiIdx]) {
+      const next = konamiIdx + 1;
+      if (next === KONAMI_CODE.length) {
+        setEasterEgg(KONAMI_MESSAGE);
+        setKonamiIdx(0);
+      } else {
+        setKonamiIdx(next);
+      }
+    } else {
+      setKonamiIdx(e.code === KONAMI_CODE[0] ? 1 : 0);
+    }
+  }, [konamiIdx]);
+
+  useEffect(() => {
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleKeyDown]);
+
+  function handleTitleClick() {
+    const next = titleClicks + 1;
+    setTitleClicks(next);
+    if (next >= 5) {
+      setEasterEgg(pickRandom(TITLE_EASTER_EGG_MESSAGES));
+      setTitleClicks(0);
+    }
+  }
+
+  function loadDemoRepo() {
+    setForm({
+      ...form,
+      owner: DEMO_REPO.owner,
+      repo: DEMO_REPO.repo,
+      org: DEMO_REPO.org,
+      question: "Did dependency upgrades introduce risk and require policy review?",
+    });
+  }
+
   const sources = capabilities?.capabilities?.sources ?? {};
 
   function startInvestigation(e: FormEvent) {
     e.preventDefault();
     if (!form.question.trim()) return;
-    
+
     const params = new URLSearchParams();
     Object.entries(form).forEach(([key, val]) => {
       if (val) params.append(key, val);
     });
-    
+
     router.push(`/dashboard?${params.toString()}`);
   }
 
@@ -75,16 +132,28 @@ export default function Home() {
           transition={{ delay: 0.1, type: "spring", stiffness: 200, damping: 20 }}>
           Security Intelligence Platform
         </motion.span>
-        <motion.h1 className="bTitle"
+        <motion.h1 className="bTitle bTitleClickable"
+          onClick={handleTitleClick}
+          title="Click 5 times… if you dare"
           initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.15, type: "spring", stiffness: 150, damping: 20 }}>
           HarborGuard
         </motion.h1>
-        <motion.p className="bSub"
-          initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.2, type: "spring", stiffness: 180, damping: 20 }}>
-          Coral-powered investigation across GitHub, Slack, Notion, and vulnerability databases.
-        </motion.p>
+        <p className="bSub">{tagline}</p>
+
+        <AnimatePresence>
+          {easterEgg && (
+            <motion.div
+              className="easterEggToast"
+              initial={{ opacity: 0, y: -8, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -8 }}
+              onClick={() => setEasterEgg(null)}
+            >
+              {easterEgg}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <div className="caseGrid">
           {CASE_PRESETS.map((p, i) => (
@@ -102,8 +171,20 @@ export default function Home() {
           ))}
         </div>
 
+        <button type="button" className="demoRepoBtn" onClick={loadDemoRepo}>
+          <span className="demoRepoIcon">⚓</span>
+          <span>
+            <strong>{DEMO_REPO.label}</strong>
+            <em>{DEMO_REPO.desc}</em>
+          </span>
+        </button>
+
         <form className="qForm" onSubmit={startInvestigation}>
           <div className="qArea">
+            <div className="qAreaHead">
+              <span className={`modeChip mode-${activeMode}`}>{activeMode === "general" ? "Custom" : activeMode}</span>
+              <span className="qAreaHint">{form.owner}/{form.repo}</span>
+            </div>
             <textarea className="qInput" value={form.question}
               onChange={e => setForm({ ...form, question: e.target.value })}
               placeholder="Ask a security question..." rows={3} />
@@ -139,6 +220,8 @@ export default function Home() {
           ))}
           {Object.keys(sources).length === 0 && <span className="srcLoading">Loading sources…</span>}
         </div>
+
+        <p className="bFooterHint">Tip: try the demo repo, or click the title five times. We&apos;re not judging.</p>
 
         {error && <p className="bError">{error}</p>}
       </div>

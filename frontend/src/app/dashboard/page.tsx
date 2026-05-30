@@ -1,10 +1,19 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { Suspense, useEffect, useState, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { EvidenceGraph } from "../components/EvidenceGraph";
+import { LoadingQuipDisplay } from "../components/LoadingQuipDisplay";
 import { SchemaPanel } from "../components/SchemaPanel";
+import {
+  MODE_META,
+  detectMode,
+  getCompletionQuip,
+  getLoadingQuip,
+  DEFAULT_LOADING_QUIP,
+  type LoadingQuipContext,
+} from "../utils/flavor";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -100,7 +109,6 @@ const NODE_ICONS: Record<string, string> = {
 /* ═══════════════════════════════════════════════
    MAIN COMPONENT
    ═══════════════════════════════════════════════ */
-import { Suspense } from "react";
 
 export default function Dashboard() {
   return (
@@ -122,6 +130,8 @@ function DashboardContent() {
   const [activeTab, setActiveTab] = useState<"trace" | "execution" | "planner" | "sql" | "raw">("trace");
   const [liveSteps, setLiveSteps] = useState<string[]>([]);
   const [liveQueries, setLiveQueries] = useState<LiveQuery[]>([]);
+  const [loadingQuip, setLoadingQuip] = useState(DEFAULT_LOADING_QUIP);
+  const [completionQuip, setCompletionQuip] = useState<string | null>(null);
   const hasRun = useRef(false);
 
   // Extract query parameters for the payload
@@ -136,6 +146,9 @@ function DashboardContent() {
   const package_name = searchParams.get("package_name") || "";
   const package_version = searchParams.get("package_version") || "";
 
+  const investigationMode = detectMode(question);
+  const modeMeta = MODE_META[investigationMode];
+
   async function refreshCapabilities() {
     try {
       const r = await fetch(`${API_BASE}/agent/capabilities`);
@@ -147,6 +160,48 @@ function DashboardContent() {
   }
 
   useEffect(() => { void refreshCapabilities(); }, []);
+
+  const latestQueryName =
+    liveQueries.length > 0 ? liveQueries[liveQueries.length - 1]?.name : undefined;
+  const latestProgress =
+    liveSteps.length > 0 ? liveSteps[liveSteps.length - 1] : undefined;
+
+  const buildLoadingQuipContext = (overrides?: Partial<LoadingQuipContext>) => ({
+    mode: investigationMode,
+    queryCount: liveQueries.length,
+    stepCount: liveSteps.length,
+    latestQueryName,
+    latestProgress,
+    owner,
+    repo,
+    ...overrides,
+  });
+
+  /* Pick a fun quip only after mount — pickRandom() must not run during SSR. */
+  useEffect(() => {
+    setLoadingQuip(
+      getLoadingQuip(buildLoadingQuipContext({ queryCount: 0, stepCount: 0 })),
+    );
+  }, []);
+
+  useEffect(() => {
+    if (!loading) return;
+    setLoadingQuip(getLoadingQuip(buildLoadingQuipContext()));
+    const id = setInterval(
+      () => setLoadingQuip(getLoadingQuip(buildLoadingQuipContext())),
+      4500,
+    );
+    return () => clearInterval(id);
+  }, [
+    loading,
+    liveQueries.length,
+    liveSteps.length,
+    latestQueryName,
+    latestProgress,
+    investigationMode,
+    owner,
+    repo,
+  ]);
 
   useEffect(() => {
     if (hasRun.current) return;
@@ -211,6 +266,12 @@ function DashboardContent() {
                 ]);
               } else if (data.type === "complete") {
                 setResult(data.data);
+                setCompletionQuip(
+                  getCompletionQuip(
+                    data.data?.risk_level,
+                    (data.data?.findings ?? []).length,
+                  ),
+                );
                 setLoading(false);
                 receivedComplete = true;
               } else if (data.type === "error") {
@@ -252,8 +313,12 @@ function DashboardContent() {
               <div className="ring r3" />
             </div>
             <div className="loadHeroText">
+              <span className={`modeBadge mode-${investigationMode}`}>
+                {modeMeta.emoji} {modeMeta.label}
+              </span>
               <h2 className="loadingTitle">Investigation in Progress</h2>
-              <p className="loadSubtitle">Live feed from Coral — full SQL shown for every query.</p>
+              <LoadingQuipDisplay text={loadingQuip} mode={investigationMode} />
+              <p className="loadRepoTag">{owner}/{repo}</p>
             </div>
           </header>
 
@@ -305,9 +370,12 @@ function DashboardContent() {
         <header className="topBar">
           <div className="tbBrand">
             <strong className="tbLogo">HarborGuard</strong>
-            <span className="tbTag">Investigation</span>
+            <span className={`modeBadge mode-${investigationMode}`}>
+              {modeMeta.emoji} {modeMeta.label}
+            </span>
           </div>
           <div className="tbCenter">
+            <span className="tbRepo">{owner}/{repo}</span>
             <span className="tbQ">{question}</span>
           </div>
           <div className="tbRight">
@@ -376,6 +444,10 @@ function DashboardContent() {
           </div>
         </section>
 
+        {completionQuip && (
+          <p className="completionQuip">{completionQuip}</p>
+        )}
+
         {/* ─── Main Area ─── */}
         <div className="mainArea">
           <section className="graphPanel">
@@ -388,7 +460,11 @@ function DashboardContent() {
               {findings.map((f, i) => (
                 <FindingCard key={f.graph_node_id ?? f.title} finding={f} delay={i * 0.1} />
               ))}
-              {findings.length === 0 && <p className="feedEmpty">No findings detected.</p>}
+              {findings.length === 0 && (
+                <p className="feedEmpty">
+                  No findings detected. {completionQuip ?? "The harbor is calm."}
+                </p>
+              )}
               {reviewSignals.length > 0 && (
                 <>
                   <h3 className="secTitle reviewTitle">Review Signals <span className="badge">{reviewSignals.length}</span></h3>

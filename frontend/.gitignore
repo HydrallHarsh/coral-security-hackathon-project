@@ -4,3 +4,4 @@ out/
 dist/
 *.log
 .env.local
+tsconfig.tsbuildinfo

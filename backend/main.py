@@ -647,6 +647,211 @@ def extract_candidates_from_manifest(
     return candidates
 
 
+def investigation_intent(question: str) -> dict[str, bool]:
+    lowered = question.lower()
+    return {
+        "dependency": any(
+            word in lowered
+            for word in ("dependency", "package", "cve", "vulnerability", "vulnerable", "upgrade")
+        ),
+        "policy": any(word in lowered for word in ("policy", "compliance", "violation")),
+        "secrets": any(
+            word in lowered
+            for word in ("secret", "token", "credential", "leak", "exposed", "credentials")
+        ),
+        "release": any(
+            word in lowered
+            for word in ("release", "deploy", "production", "safe to deploy")
+        ),
+    }
+
+
+def classify_env_file_path(path: str) -> str:
+    """Classify env-like paths to reduce false positives from deliberate template files."""
+    lowered = path.lower().replace("\\", "/")
+    basename = lowered.rsplit("/", 1)[-1]
+
+    template_names = (
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.dist",
+        ".env.defaults",
+        ".env.default",
+        "env.example",
+        "example.env",
+        ".env.test.example",
+        ".env.local.example",
+        ".env.development.example",
+    )
+    template_suffixes = (".example", ".sample", ".template", ".dist", ".defaults", ".mock")
+    template_dirs = ("/examples/", "/example/", "/fixtures/", "/testdata/", "/test/fixtures/", "/docs/")
+
+    if basename in template_names or any(basename.endswith(suffix) for suffix in template_suffixes):
+        return "template"
+    if any(segment in lowered for segment in template_dirs):
+        return "template"
+    if basename in (".env.local", ".env.dev", ".env.development", ".env.test"):
+        return "dev_local"
+    if basename == ".env" or basename.startswith(".env."):
+        return "likely_real"
+    return "unknown"
+
+
+def fetch_github_default_branch(owner: str, repo: str) -> str | None:
+    import urllib.request
+
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "HarborGuard"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            branch = payload.get("default_branch")
+            return str(branch) if branch else None
+    except Exception as error:
+        logger.warning(
+            "github.default_branch.failed owner=%s repo=%s error=%s",
+            owner,
+            repo,
+            compact_text(str(error)),
+        )
+        return None
+
+
+def fetch_github_raw_file(
+    owner: str,
+    repo: str,
+    path: str,
+    branch: str | None = None,
+) -> tuple[str, str] | None:
+    import urllib.request
+
+    branches: list[str] = []
+    if branch:
+        branches.append(branch)
+    default_branch = fetch_github_default_branch(owner, repo)
+    if default_branch and default_branch not in branches:
+        branches.append(default_branch)
+    for fallback in ("main", "master"):
+        if fallback not in branches:
+            branches.append(fallback)
+
+    for ref in branches:
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path.lstrip('/')}"
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "HarborGuard"})
+            with urllib.request.urlopen(request, timeout=8) as response:
+                return response.read().decode("utf-8"), url
+        except Exception:
+            continue
+    return None
+
+
+def fetch_manifest_candidates(owner: str, repo: str) -> list[dict[str, object]]:
+    manifest_paths = (
+        "package.json",
+        "frontend/package.json",
+        "apps/web/package.json",
+        "packages/app/package.json",
+    )
+    for manifest_path in manifest_paths:
+        fetched = fetch_github_raw_file(owner, repo, manifest_path)
+        if not fetched:
+            continue
+        content, url = fetched
+        candidates = extract_candidates_from_manifest(content, "npm", url)
+        if candidates:
+            logger.info(
+                "manifest.found path=%s url=%s candidates=%s",
+                manifest_path,
+                url,
+                len(candidates),
+            )
+            return candidates
+    return []
+
+
+def is_secret_bearing_path(path: str) -> bool:
+    lowered = path.lower().replace("\\", "/")
+    basename = lowered.rsplit("/", 1)[-1]
+    if basename in ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "readme.md"):
+        return False
+    classification = classify_env_file_path(path)
+    if classification in ("likely_real", "dev_local"):
+        return True
+    if classification == "template":
+        return False
+    return any(
+        token in basename
+        for token in (".env", "secret", "credential", "id_rsa", "private", ".pem", ".key")
+    )
+
+
+def probe_committed_env_file(owner: str, repo: str) -> dict[str, object] | None:
+    fetched = fetch_github_raw_file(owner, repo, ".env")
+    if not fetched:
+        return None
+    _content, url = fetched
+    return {
+        "name": ".env",
+        "path": ".env",
+        "html_url": url.replace("raw.githubusercontent.com", "github.com").replace("/main/", "/blob/main/"),
+        "repository_full_name": f"{owner}/{repo}",
+        "source": "github.raw",
+    }
+
+
+def build_secret_file_search_sql(owner: str, repo: str, *, secrets_focus: bool) -> str:
+    owner_ref = f"{owner}/{repo}"
+    query = f"repo:{owner_ref} filename:.env"
+    safe_query = sql_string(query)
+    return f"""
+        SELECT name, path, html_url, repository_full_name
+        FROM github.search_code(q => '{safe_query}')
+        LIMIT 10
+        """
+
+
+def build_dynamic_tool_sql(
+    original_name: str,
+    args: dict[str, object],
+    req: AgentInvestigationReq,
+    capabilities: dict[str, object],
+) -> str | None:
+    if original_name == "github.alerts":
+        if not github_alerts_enabled():
+            return None
+        filters: list[str] = []
+        org = args.get("org") or args.get("owner") or req.org or req.owner
+        if org:
+            filters.append(f"org = '{sql_string(str(org))}'")
+        if args.get("state"):
+            filters.append(f"state = '{sql_string(str(args['state']))}'")
+        where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
+        return f"SELECT * FROM github.alerts{where_clause} LIMIT 10"
+
+    tool_info = capabilities.get("tools", {}).get(original_name, {})
+    kind = tool_info.get("kind", "table")
+    if kind in ("function", "table_function"):
+        args_list = []
+        for key, value in args.items():
+            args_list.append(f"{key} => '{sql_string(str(value))}'")
+        args_sql = ", ".join(args_list)
+        return f"SELECT * FROM {original_name}({args_sql}) LIMIT 10"
+
+    filters = []
+    for key, value in args.items():
+        if original_name == "github.alerts" and key == "owner":
+            key = "org"
+        filters.append(f"{key} = '{sql_string(str(value))}'")
+    where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
+    return f"SELECT * FROM {original_name}{where_clause} LIMIT 10"
+
+
 def extract_package_target(
     req: AgentInvestigationReq,
     pull_step: dict[str, object],
@@ -1702,6 +1907,7 @@ def build_agent_findings(
 ) -> list[dict[str, object]]:
     by_name = {str(step["name"]): step for step in steps}
     findings: list[dict[str, object]] = []
+    intent = investigation_intent(req.question)
 
     alerts = first_rows(by_name.get("github_dependabot_alerts", {}), limit=10)
     for alert in alerts:
@@ -1752,16 +1958,34 @@ def build_agent_findings(
                 "recommendation": risk["recommendation"],
             })
 
-    secret_hits = first_rows(by_name.get("github_secret_file_search", {}), limit=10)
-    if secret_hits:
-        low_tier = (".env.example", ".env.sample", ".env.template", ".env.local", ".env.dev")
-        high_hits = []
-        low_hits = []
-        
-        for row in secret_hits:
-            path = str(row.get("path") or row.get("name") or "").lower()
-            if any(path.endswith(l) for l in low_tier):
-                low_hits.append(row)
+    secret_rows: list[dict] = []
+    secret_step = by_name.get("github_secret_file_search")
+    if secret_step and secret_step.get("ok"):
+        secret_rows.extend(first_rows(secret_step, limit=10))
+    if intent["secrets"]:
+        for step in steps:
+            if not step.get("is_dynamic") or not step.get("ok"):
+                continue
+            sql = str(step.get("sql") or "")
+            if "github.search_code" in sql:
+                secret_rows.extend(first_rows(step, limit=10))
+
+    if secret_rows:
+        high_hits: list[dict] = []
+        template_hits: list[dict] = []
+        dev_local_hits: list[dict] = []
+
+        for row in secret_rows:
+            path = str(row.get("path") or row.get("name") or "")
+            if not is_secret_bearing_path(path):
+                continue
+            classification = classify_env_file_path(path)
+            if classification == "template":
+                template_hits.append(row)
+            elif classification == "dev_local":
+                dev_local_hits.append(row)
+            elif classification == "likely_real":
+                high_hits.append(row)
             else:
                 high_hits.append(row)
 
@@ -1769,13 +1993,13 @@ def build_agent_findings(
             findings.append(
                 {
                     "type": "possible_secret_exposure",
-                    "title": "Repository contains files that may expose secrets",
+                    "title": "Repository contains files that may expose live secrets",
                     "severity": "high",
                     "score": 70,
                     "evidence": [
                         {
                             "source": "github.search_code",
-                            "text": f"{row.get('path') or row.get('name')}",
+                            "text": str(row.get("path") or row.get("name") or "unknown path"),
                             "url": row.get("html_url"),
                         }
                         for row in high_hits[:5]
@@ -1783,31 +2007,173 @@ def build_agent_findings(
                     "recommendation": "Review matched files and rotate exposed credentials if needed.",
                 }
             )
-        if low_hits:
+        if template_hits and intent["secrets"]:
             findings.append(
                 {
-                    "type": "possible_secret_exposure",
-                    "title": "Example/Template secret files found",
-                    "severity": "low",
-                    "score": 10,
+                    "type": "template_env_files",
+                    "title": (
+                        f"Found {len(template_hits)} template/example env file(s) — "
+                        "likely deliberate, not live credentials"
+                    ),
+                    "severity": "informational",
+                    "score": 3,
                     "evidence": [
                         {
                             "source": "github.search_code",
-                            "text": f"{row.get('path') or row.get('name')}",
+                            "text": str(row.get("path") or row.get("name") or "unknown path"),
                             "url": row.get("html_url"),
                         }
-                        for row in low_hits[:5]
+                        for row in template_hits[:5]
                     ],
-                    "recommendation": "Ensure no actual credentials are hardcoded in template files.",
+                    "recommendation": "Confirm these are placeholders only and contain no real secrets.",
                 }
             )
+        if dev_local_hits and intent["secrets"]:
+            findings.append(
+                {
+                    "type": "dev_env_files",
+                    "title": (
+                        f"Found {len(dev_local_hits)} local/dev env file(s) — "
+                        "review for accidental production use"
+                    ),
+                    "severity": "low",
+                    "score": 8,
+                    "evidence": [
+                        {
+                            "source": "github.search_code",
+                            "text": str(row.get("path") or row.get("name") or "unknown path"),
+                            "url": row.get("html_url"),
+                        }
+                        for row in dev_local_hits[:5]
+                    ],
+                    "recommendation": "Ensure dev env files are gitignored and not deployed to production.",
+                }
+            )
+    elif intent["secrets"] and secret_step and not secret_step.get("ok"):
+        findings.append(
+            {
+                "type": "secrets_scan_incomplete",
+                "title": "Secrets scan could not complete — code search query failed",
+                "severity": "informational",
+                "score": 0,
+                "evidence": [
+                    {
+                        "source": "github.search_code",
+                        "text": str(secret_step.get("error") or "search failed"),
+                        "url": None,
+                    }
+                ],
+                "recommendation": "Retry the investigation or verify GitHub code search permissions.",
+            }
+        )
+    elif intent["secrets"] and secret_step and secret_step.get("ok"):
+        findings.append(
+            {
+                "type": "secrets_scan_clear",
+                "title": "Secrets scan found no credential-bearing files in repository search",
+                "severity": "informational",
+                "score": 0,
+                "evidence": [
+                    {
+                        "source": "github.search_code",
+                        "text": "Searched for .env, key, credential, and PEM patterns with no high-risk matches.",
+                        "url": None,
+                    }
+                ],
+                "recommendation": "No immediate secret exposure detected from configured code search.",
+            }
+        )
 
-    raw_policy_rows = first_rows(by_name.get("notion_policy_context", {}), limit=3)
+    raw_policy_rows = first_rows(by_name.get("notion_policy_context", {}), limit=5)
     policy_rows = []
     for row in raw_policy_rows:
-        text_to_check = f"{row.get('title', '')} {row.get('url', '')}".lower()
-        if any(term in text_to_check for term in ("security", "policy", "vulnerability")):
+        text_to_check = f"{row.get('title', '')} {row.get('url', '')} {row.get('raw', '')}".lower()
+        if any(term in text_to_check for term in ("security", "policy", "vulnerability", "compliance")):
             policy_rows.append(row)
+
+    if policy_rows and intent["policy"]:
+        findings.append(
+            {
+                "type": "policy_context_match",
+                "title": f"Internal policy documents match this investigation ({len(policy_rows)} hit(s))",
+                "severity": "medium",
+                "score": 20,
+                "evidence": [
+                    {
+                        "source": "notion.search",
+                        "text": str(row.get("title") or row.get("url") or row.get("id") or "policy document"),
+                        "url": row.get("url"),
+                    }
+                    for row in policy_rows[:5]
+                ],
+                "recommendation": "Cross-check recent changes against the matched policy documents.",
+            }
+        )
+    elif intent["policy"] and by_name.get("notion_policy_context", {}).get("ok"):
+        findings.append(
+            {
+                "type": "policy_scan_clear",
+                "title": "No direct policy document matches found for this investigation query",
+                "severity": "informational",
+                "score": 0,
+                "evidence": [
+                    {
+                        "source": "notion.search",
+                        "text": "Notion policy search completed without strong policy keyword matches.",
+                        "url": None,
+                    }
+                ],
+                "recommendation": "Verify policy coverage manually if this repo handles sensitive data.",
+            }
+        )
+
+    if intent["release"]:
+        pull_rows = first_rows(by_name.get("github_recent_pulls", {}), limit=8)
+        commit_rows = first_rows(by_name.get("github_recent_commits", {}), limit=8)
+        vuln_count = sum(1 for item in findings if item.get("type") == "vulnerable_dependency")
+        secret_count = sum(1 for item in findings if item.get("type") == "possible_secret_exposure")
+        if vuln_count or secret_count:
+            blockers: list[str] = []
+            if vuln_count:
+                blockers.append(f"{vuln_count} vulnerable package(s)")
+            if secret_count:
+                blockers.append(f"{secret_count} potential secret exposure(s)")
+            findings.append(
+                {
+                    "type": "release_blocked",
+                    "title": "Release not recommended for production",
+                    "severity": "critical" if vuln_count else "high",
+                    "score": 95 if vuln_count else 80,
+                    "evidence": [
+                        {
+                            "source": "harborguard.release",
+                            "text": "Release blockers: " + ", ".join(blockers) + ".",
+                            "url": None,
+                        }
+                    ],
+                    "recommendation": "Resolve blockers before deploying to production.",
+                }
+            )
+        elif pull_rows or commit_rows:
+            findings.append(
+                {
+                    "type": "release_readiness_context",
+                    "title": "Release readiness reviewed from recent pull requests and commits",
+                    "severity": "informational",
+                    "score": 5,
+                    "evidence": [
+                        {
+                            "source": "github.pulls" if pull_rows else "github.commits",
+                            "text": (
+                                f"Reviewed {len(pull_rows)} recent PR(s) and {len(commit_rows)} commit(s) "
+                                "for release risk indicators."
+                            ),
+                            "url": None,
+                        }
+                    ],
+                    "recommendation": "Combine this signal with dependency and secret scans before deploying.",
+                }
+            )
             
     slack_rows = first_rows(by_name.get("slack_security_discussion", {}), limit=3)
     for finding in findings:
@@ -2200,16 +2566,123 @@ def build_assessment_answer(
     finding_count: int,
     review_signal_count: int,
     target_text: str,
+    question: str = "",
+    findings: list[dict[str, object]] | None = None,
 ) -> str:
+    intent = investigation_intent(question)
     target_suffix = f" Target: {target_text}."
-    if finding_count:
+    all_findings = findings or []
+    actionable_findings = [
+        f for f in all_findings
+        if int(f.get("score", 0)) >= 10 and f.get("type") not in ("policy_scan_clear", "secrets_scan_clear")
+    ]
+    actionable_count = len(actionable_findings)
+    vuln_findings = [f for f in all_findings if f.get("type") == "vulnerable_dependency"]
+    secret_findings = [f for f in all_findings if f.get("type") == "possible_secret_exposure"]
+    policy_matches = [f for f in all_findings if f.get("type") == "policy_context_match"]
+    release_blocked = any(f.get("type") == "release_blocked" for f in all_findings)
+
+    if actionable_count == 0:
+        if intent["dependency"]:
+            if target_text == "none":
+                return (
+                    "Dependency scan ran but no package targets were confirmed from this repository. "
+                    "No CVE evidence was collected."
+                    f"{target_suffix}"
+                )
+            return (
+                f"Dependency scan completed for {target_text} with no high-confidence CVE findings."
+                f"{target_suffix}"
+            )
+        if intent["secrets"]:
+            if any(f.get("type") == "secrets_scan_clear" for f in all_findings):
+                return (
+                    "Secrets scan completed — no live credential files detected in repository search."
+                    f"{target_suffix}"
+                )
+            if any(f.get("type") == "template_env_files" for f in all_findings):
+                return (
+                    "Secrets scan found template/example env files only — likely deliberate, not live credentials."
+                    f"{target_suffix}"
+                )
+            if review_signal_count:
+                return (
+                    "Secrets scan found no credential files, but PR review signals warrant manual inspection."
+                    f"{target_suffix}"
+                )
+        if intent["policy"]:
+            if policy_matches:
+                return (
+                    "Policy review completed — internal policy documents match this investigation."
+                    f"{target_suffix}"
+                )
+            return (
+                "Policy review completed — no direct policy violations confirmed from available sources."
+                f"{target_suffix}"
+            )
+        if intent["release"]:
+            return (
+                "Release readiness review completed — see findings and review signals before deploying."
+                f"{target_suffix}"
+            )
+
+    if actionable_count:
+        if intent["secrets"]:
+            if secret_findings:
+                return (
+                    f"Secrets scan flagged {len(secret_findings)} credential exposure risk(s)."
+                    + (
+                        f" Also found {len(vuln_findings)} vulnerable package(s) during dependency scan."
+                        if vuln_findings
+                        else ""
+                    )
+                    + target_suffix
+                )
+            if vuln_findings:
+                return (
+                    f"Secrets scan found no credential files, but dependency scan flagged "
+                    f"{len(vuln_findings)} vulnerable package(s) worth reviewing."
+                    f"{target_suffix}"
+                )
+        if intent["release"]:
+            if release_blocked:
+                return (
+                    "Release blocked — critical security blockers detected. Do not deploy to production."
+                    f"{target_suffix}"
+                )
+            return (
+                f"Release readiness review found {actionable_count} issue(s) requiring attention before deploy."
+                f"{target_suffix}"
+            )
+        if intent["dependency"] and vuln_findings:
+            return (
+                f"Dependency scan found {len(vuln_findings)} vulnerable package(s) with CVE evidence."
+                f"{target_suffix}"
+            )
+        if intent["policy"]:
+            if policy_matches:
+                return (
+                    f"Policy review found {len(policy_matches)} policy match(es)"
+                    + (
+                        f" and {len(vuln_findings)} vulnerable package(s)."
+                        if vuln_findings
+                        else "."
+                    )
+                    + target_suffix
+                )
+            if vuln_findings and not policy_matches:
+                return (
+                    f"Policy review found no direct policy violations, but {len(vuln_findings)} "
+                    f"vulnerable package(s) may violate dependency security policies."
+                    f"{target_suffix}"
+                )
         if review_signal_count:
             return (
-                f"HarborGuard found {finding_count} confirmed security or compliance "
+                f"HarborGuard found {actionable_count} confirmed security or compliance "
                 f"finding(s) and {review_signal_count} review signal(s).{target_suffix}"
             )
         return (
-            f"HarborGuard found {finding_count} confirmed security or compliance "
+            f"HarborGuard found {actionable_count} confirmed security or compliance "
             f"finding(s).{target_suffix}"
         )
     if review_signal_count:
@@ -2547,11 +3020,12 @@ def agent_investigate_internal(
           AND state = 'open'
         LIMIT 20
         """
-        github_secret_file_search_sql = f"""
-        SELECT name, path, html_url, repository_full_name
-        FROM github.search_code(q => 'repo:{owner}/{repo} filename:.env')
-        LIMIT 10
-        """
+        question_intent = investigation_intent(req.question)
+        github_secret_file_search_sql = build_secret_file_search_sql(
+            req.owner,
+            req.repo,
+            secrets_focus=question_intent["secrets"],
+        )
         notion_policy_context_sql = f"""
         SELECT id, object, url, public_url, raw
         FROM notion.search
@@ -2613,16 +3087,13 @@ def agent_investigate_internal(
 
         # Phase 2: extract target package/version from PRs and alerts.
         emit("Extracting manifest and package candidates...")
-        manifest_candidates = []
-        try:
-            import urllib.request
-            url = f"https://raw.githubusercontent.com/{req.owner}/{req.repo}/main/package.json"
-            req_obj = urllib.request.Request(url)
-            with urllib.request.urlopen(req_obj, timeout=5) as response:
-                content = response.read().decode('utf-8')
-            manifest_candidates = extract_candidates_from_manifest(content, "npm", url)
-        except Exception as e:
-            logger.warning("Failed to fetch package.json for manifest pass: %s", e)
+        manifest_candidates = fetch_manifest_candidates(req.owner, req.repo)
+        if not manifest_candidates:
+            logger.warning(
+                "manifest.pass.empty owner=%s repo=%s tried=package.json paths on default branch",
+                req.owner,
+                req.repo,
+            )
 
         package_target, extraction = extract_package_target(
             req,
@@ -2709,8 +3180,23 @@ def agent_investigate_internal(
             steps.append(skipped_step("osv_package_vulnerabilities", reason))
 
         # Phase 4: run selected contextual enrichments around the repo/package.
-        if "github.search_code" in selected_tools and tool_available(capabilities, "github.search_code"):
-            steps.append(query_step("github_secret_file_search", github_secret_file_search_sql))
+        run_secret_search = tool_available(capabilities, "github.search_code") and (
+            question_intent["secrets"] or "github.search_code" in selected_tools
+        )
+        if run_secret_search:
+            secret_step = query_step("github_secret_file_search", github_secret_file_search_sql)
+            if question_intent["secrets"]:
+                search_rows = first_rows(secret_step, limit=10)
+                if not search_rows:
+                    env_hit = probe_committed_env_file(req.owner, req.repo)
+                    if env_hit:
+                        secret_step = {
+                            **secret_step,
+                            "rows": [env_hit],
+                            "purpose": "Committed .env detected via GitHub raw API fallback",
+                            "sql": f"bypass: raw .env probe ({env_hit.get('html_url')})",
+                        }
+            steps.append(secret_step)
         else:
             skipped = next(
                 (
@@ -2722,7 +3208,12 @@ def agent_investigate_internal(
             )
             steps.append(skipped_step("github_secret_file_search", skipped["reason"]))
 
-        if "notion.search" in selected_tools and tool_available(capabilities, "notion.search"):
+        run_policy_search = tool_available(capabilities, "notion.search") and (
+            question_intent["policy"]
+            or question_intent["release"]
+            or "notion.search" in selected_tools
+        )
+        if run_policy_search:
             steps.append(query_step("notion_policy_context", notion_policy_context_sql))
         else:
             skipped = next(
@@ -2805,40 +3296,46 @@ def agent_investigate_internal(
                     
                     tool_name_map = payload.get("tool_name_map", {})
                     original_name = tool_name_map.get(tool_name, tool_name.replace("_", ".", 1))
-                    tool_info = capabilities.get("tools", {}).get(original_name, {})
-                    kind = tool_info.get("kind", "table")
-                
-                    if kind in ("function", "table_function"):
-                        args_list = []
-                        for k, v in args.items():
-                            args_list.append(f"{k} => '{sql_string(str(v))}'")
-                        args_str_sql = ", ".join(args_list)
-                        sql = f"SELECT * FROM {original_name}({args_str_sql}) LIMIT 10"
-                    else:
-                        filters = []
-                        for k, v in args.items():
-                            filters.append(f"{k} = '{sql_string(str(v))}'")
-                        where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
-                        sql = f"SELECT * FROM {original_name}{where_clause} LIMIT 10"
+                    step_name = f"dynamic_tool_{turn}_{i}"
+
+                    if original_name == "github.alerts" and not github_alerts_enabled():
+                        steps.append(skipped_step(
+                            step_name,
+                            "GitHub Dependabot org alerts are disabled by default",
+                        ))
+                        payload["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps({"error": "github.alerts disabled"}),
+                        })
+                        continue
+
+                    sql = build_dynamic_tool_sql(original_name, args, req, capabilities)
+                    if not sql:
+                        steps.append(skipped_step(step_name, f"Unsupported or blocked dynamic tool: {original_name}"))
+                        payload["messages"].append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps({"error": "tool query blocked"}),
+                        })
+                        continue
 
                     purpose = f"Dynamic query for {original_name}"
-                    step_name = f"dynamic_tool_{turn}_{i}"
                     try:
                         started_at_q = time.perf_counter()
                     
                         if original_name == "github.file":
-                            owner = args.get("owner", req.owner)
-                            repo = args.get("repo", req.repo)
-                            path = args.get("path", "package.json")
-                            import urllib.request
-                            url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
+                            owner = str(args.get("owner", req.owner))
+                            repo = str(args.get("repo", req.repo))
+                            path = str(args.get("path", "package.json"))
+                            fetched = fetch_github_raw_file(owner, repo, path)
+                            if not fetched:
+                                raise CoralClientError(f"Could not fetch {path} from {owner}/{repo}")
+                            content, url = fetched
                             logger.info("agent.dynamic_tool.start name=%s url=%s", step_name, url)
-                            req_obj = urllib.request.Request(url)
-                            with urllib.request.urlopen(req_obj, timeout=10) as response:
-                                content = response.read().decode('utf-8')
                             candidates = extract_candidates_from_manifest(content, "npm", url)
                             result_rows = [{"content": content, "candidates": candidates}]
-                            sql_executed = "bypass: github raw API"
+                            sql_executed = f"bypass: github raw API ({url})"
                             duration_ms = elapsed_ms(started_at_q)
                         else:
                             logger.info("agent.dynamic_tool.start name=%s sql=%s", step_name, compact_sql(sql))
@@ -2994,6 +3491,8 @@ def agent_investigate_internal(
                 len(findings),
                 len(review_signals),
                 selected_package_text,
+                req.question,
+                findings,
             ),
             "target_package": deep_scan_target,
             "package_candidate": package_target,
